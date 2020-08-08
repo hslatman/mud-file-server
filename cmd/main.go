@@ -32,7 +32,7 @@ import (
 	// plug in Caddy modules here
 	_ "github.com/caddyserver/caddy/v2/modules/standard"
 
-	_ "github.com/hslatman/muds/pkg/mud"
+	_ "github.com/hslatman/mud-file-server/pkg/mud"
 )
 
 func main() {

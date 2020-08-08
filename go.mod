@@ -1,4 +1,4 @@
-module github.com/hslatman/muds
+module github.com/hslatman/mud-file-server
 
 go 1.14
 

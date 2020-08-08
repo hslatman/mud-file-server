@@ -1,6 +1,6 @@
 # MUD File Server
 
-An example MUD File Server using [Caddy](https://caddyserver.com/) as the web server.
+A MUD File Server using [Caddy](https://caddyserver.com/) as the web server.
 
 ## Description
 
@@ -21,14 +21,14 @@ Because the repository is currently private, we need to instruct Go that the mod
 
 ```bash
 # build the server 
-$ GOPRIVATE="github.com/hslatman/muds" go build cmd/main.go -o muds
+$ GOPRIVATE="github.com/hslatman/mud-file-server" go build cmd/main.go -o muds
 ```
 
 ## Usage
 
 ```bash
 # run the server directly from Go code
-$ GOPRIVATE="github.com/hslatman/muds" go run cmd/main.go
+$ GOPRIVATE="github.com/hslatman/mud-file-server" go run cmd/main.go
 # run the server from compiled binary
 $ ./muds
 ```
