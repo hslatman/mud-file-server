@@ -1,6 +1,6 @@
 # MUD File Server
 
-An example MUD File Server using Caddy as the web server
+An example MUD File Server using [Caddy](https://caddyserver.com/) as the web server.
 
 ## Description
 

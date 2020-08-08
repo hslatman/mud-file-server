@@ -16,6 +16,8 @@ type FileServer struct {
 	// The path to the root directory with MUD files.
 	// Default is `{http.vars.root}` if set; current working directory otherwise.
 	Root string `json:"root,omitempty"`
+	// Validate request headers according to https://www.rfc-editor.org/rfc/rfc8520
+	ValidateHeaders *bool `json:"validate_headers,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -41,7 +43,13 @@ func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 
 	w.Header().Set("server", "MUD File Server") // TODO: make this optional / configurable? Add version?
 
+	if !m.validHeaders(r) {
+		w.WriteHeader(http.StatusBadRequest)
+		return nil
+	}
+
 	// TODO: determine requested file
+	// TODO: validate headers (configurable?)
 	// TODO: validate file exists; is no directory; etc.
 	// TODO: determine the type of file requested (MUD vs. its signature)
 	// TODO: validate file has valid signature (configurable?)
@@ -52,4 +60,27 @@ func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	w.Write([]byte("HELLO from MUD File Server!"))
 
 	return nil
+}
+
+func (m *FileServer) validHeaders(r *http.Request) bool {
+	if m.ValidateHeaders == nil || *m.ValidateHeaders {
+		headers := r.Header
+		accept, ok := headers["Accept"]
+		if !ok {
+			return false
+		}
+		if !contains(accept, "application/mud+json") {
+			return false
+		}
+	}
+	return true
+}
+
+func contains(s []string, e string) bool {
+	for _, a := range s {
+		if a == e {
+			return true
+		}
+	}
+	return false
 }
