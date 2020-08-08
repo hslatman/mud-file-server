@@ -1,0 +1,41 @@
+{   
+    "logging": {
+        "logs": {
+            "debug": {
+                "writer": {
+                    "output": "stdout"
+                },
+                "level": "DEBUG"
+            }
+        }
+    },
+    "apps": {
+      "http": {
+        "servers": {
+          "mud": {
+            "listen": [
+              ":9090"
+            ],
+            "routes": [
+              {
+                "group": "mud",
+                "match": [
+                  {
+                    "path": [
+                      "/*"
+                    ]
+                  }
+                ],
+                "handle": [
+                  {
+                    "handler": "mud_file_server"
+                  }
+                ]
+              }
+            ],
+            "logs": {}
+          }
+        }
+      }
+    }
+  }

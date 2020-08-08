@@ -1,2 +1,5 @@
+# ignore binaries
 xcaddy
 caddy
+main
+muds
