@@ -2,6 +2,7 @@ package mud
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
@@ -65,6 +66,7 @@ func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 func (m *FileServer) validHeaders(r *http.Request) bool {
 	if m.ValidateHeaders == nil || *m.ValidateHeaders {
 		headers := r.Header
+
 		accept, ok := headers["Accept"]
 		if !ok {
 			return false
@@ -72,13 +74,24 @@ func (m *FileServer) validHeaders(r *http.Request) bool {
 		if !contains(accept, "application/mud+json") {
 			return false
 		}
+
+		if _, ok := headers["Accept-Language"]; !ok {
+			return false
+		}
+
+		if _, ok := headers["User-Agent"]; !ok {
+			return false
+		}
+
+		// TODO: add checks for empty Accept-Language and User-Agent?
 	}
 	return true
 }
 
 func contains(s []string, e string) bool {
+	e = strings.ToLower(e)
 	for _, a := range s {
-		if a == e {
+		if strings.ToLower(a) == e {
 			return true
 		}
 	}

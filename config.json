@@ -28,7 +28,8 @@
                 ],
                 "handle": [
                   {
-                    "handler": "mud_file_server"
+                    "handler": "mud_file_server",
+                    "validate_headers": false
                   }
                 ]
               }
