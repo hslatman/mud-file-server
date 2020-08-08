@@ -35,8 +35,8 @@ $ ./muds
 
 ## TODO
 
+* Add logging
 * Change from Path Matcher to File Matcher?
-* Make mud-file-server work for serving MUD Files
 * Test TLS (local CA?)
 * Add example MUD including signature
 * Do we need some kind of abstract file system handling?
@@ -45,3 +45,4 @@ $ ./muds
 * Implement a MUD viewer to open the visualize the available MUDs?
 * Implement basic statistics about files requested?
 * More robust content type checking?
+* Decrease the Caddy footprint by importing only what we use

@@ -15,15 +15,18 @@ import (
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+
+	"github.com/hslatman/mud.yang.go/pkg/mudyang"
 )
 
 type contentType string
 
 const (
 	contentTypeMUD       contentType = "application/mud+json"
-	contentTypeSignature             = "application/pkcs7-signature"
-	contentTypeUnknown               = "unknown"
-	contentTypeInvalid               = "invalid"
+	contentTypeSignature contentType = "application/pkcs7-signature"
+	contentTypeJSON      contentType = "application/json"
+	contentTypeUnknown   contentType = "unknown"
+	contentTypeInvalid   contentType = "application/octet-stream"
 )
 
 func init() {
@@ -37,6 +40,8 @@ type FileServer struct {
 	Root string `json:"root,omitempty"`
 	// Validate request headers according to https://www.rfc-editor.org/rfc/rfc8520
 	ValidateHeaders *bool `json:"validate_headers,omitempty"`
+	// Validate the requested MUD file (if it exists)
+	ValidateMUD *bool `json:"validate_mud,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -95,21 +100,26 @@ func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 
 	fmt.Println(contentType)
 
-	switch contentType {
-	case contentTypeSignature:
-		fmt.Println("send signature")
-	case contentTypeMUD:
+	if contentType == contentTypeInvalid || contentType == contentTypeUnknown {
+		w.WriteHeader(http.StatusInternalServerError)
+		return nil
+	}
+
+	if contentType == contentTypeJSON {
 		if !m.validHeaders(r) {
 			w.WriteHeader(http.StatusBadRequest)
 			return nil
 		}
-		fmt.Println("send MUD")
-		// TODO: validate file is valid MUD (configurable?)
-		// TODO: validate file has valid signature (configurable? only when it's available in this server too?)
-	default:
-		w.WriteHeader(http.StatusInternalServerError)
-		fmt.Println("can't send unknown/invalid content type")
+		var ok bool
+		contentType, ok = m.validMUD(filename)
+		fmt.Println(contentType)
+		if !ok {
+			w.WriteHeader(http.StatusInternalServerError)
+			return nil
+		}
 	}
+
+	fmt.Println(contentType)
 
 	file, err := m.openFile(filename)
 	if err != nil {
@@ -127,6 +137,7 @@ func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	return nil
 }
 
+// validHeaders validates the request headers
 func (m *FileServer) validHeaders(r *http.Request) bool {
 	if m.ValidateHeaders == nil || *m.ValidateHeaders {
 		headers := r.Header
@@ -150,6 +161,22 @@ func (m *FileServer) validHeaders(r *http.Request) bool {
 		// TODO: add checks for empty Accept-Language and User-Agent?
 	}
 	return true
+}
+
+// validMUD validates the JSON to be a valid MUD according to RFC 8520
+func (m *FileServer) validMUD(path string) (contentType, bool) {
+	if m.ValidateMUD == nil || *m.ValidateMUD {
+		json, err := ioutil.ReadFile(path)
+		if err != nil {
+			return contentTypeInvalid, false
+		}
+		mud := &mudyang.Mudfile{}
+		if err := mudyang.Unmarshal([]byte(json), mud); err != nil {
+			return contentTypeJSON, false
+		}
+		return contentTypeMUD, true
+	}
+	return contentTypeJSON, true
 }
 
 // contains looks for a needle string in a haystack of strings
@@ -202,10 +229,10 @@ func (m *FileServer) detectContentType(path string) (contentType, error) {
 	var data map[string]interface{}
 	if err := json.Unmarshal(contents, &data); err == nil {
 		// if the file can be unmarshalled as JSON, this may be a MUD file
-		return contentTypeMUD, nil
+		return contentTypeJSON, nil
 	}
 
-	return contentTypeInvalid, nil
+	return contentTypeInvalid, nil // TODO: application/octet-stream?
 }
 
 // openFile opens the file at the given filename.
