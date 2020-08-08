@@ -4,11 +4,16 @@ An example MUD File Server using [Caddy](https://caddyserver.com/) as the web se
 
 ## Description
 
-Manufacturer Usage Descriptions (MUDs) allow manufacturers of IoT equipment to specify the intended network communication patterns of the devices they manufacture. 
+[Manufacturer Usage Descriptions](https://www.rfc-editor.org/rfc/rfc8520) (MUDs) allow manufacturers of IoT equipment to specify the intended network communication patterns of the devices they manufacture. 
 The access control policies described in a MUD file allow network controllers to automatically enforce rules on the device, resulting in devices only being allowed to communicate within the boundaries of the access control policies.
 
 This repository contains an implementation of a MUD File Server based on the Caddy web server.
 MUD File Servers are responsible for serving MUD Files and their signatures, which can be retrieved by MUD Controllers when an IoT device emits a MUD URL.
+
+MUR URLs have the following basic properties:
+
+* They always use the "https" scheme
+* Any "https://" URL can be a MUD URL
 
 ## Build
 
@@ -39,3 +44,4 @@ $ ./muds
 * Implement a simple overview page of MUDs available?
 * Implement a MUD viewer to open the visualize the available MUDs?
 * Implement basic statistics about files requested?
+* More robust content type checking?

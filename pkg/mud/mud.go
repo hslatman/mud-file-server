@@ -1,11 +1,29 @@
 package mud
 
 import (
+	"encoding/json"
+	"fmt"
+	"io/ioutil"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"strconv"
 	"strings"
+
+	"go.mozilla.org/pkcs7"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+)
+
+type contentType string
+
+const (
+	contentTypeMUD       contentType = "application/mud+json"
+	contentTypeSignature             = "application/pkcs7-signature"
+	contentTypeUnknown               = "unknown"
+	contentTypeInvalid               = "invalid"
 )
 
 func init() {
@@ -44,21 +62,67 @@ func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 
 	w.Header().Set("server", "MUD File Server") // TODO: make this optional / configurable? Add version?
 
-	if !m.validHeaders(r) {
-		w.WriteHeader(http.StatusBadRequest)
+	fmt.Println(r)
+	fmt.Println(r.URL.Path)
+
+	replacer := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
+
+	root := replacer.ReplaceAll(m.Root, ".")
+	suffix := replacer.ReplaceAll(r.URL.Path, "")
+	filename := sanitizedPathJoin(root, suffix)
+
+	fmt.Println(filename)
+
+	// get information about the file
+	info, err := os.Stat(filename)
+	if err != nil {
+		// TODO: perform better checks? not exists vs permission error?
+		return m.notFound(w, r, next)
+	}
+
+	fmt.Println(info)
+
+	if info.IsDir() {
+		w.WriteHeader(http.StatusNotAcceptable)
 		return nil
 	}
 
-	// TODO: determine requested file
-	// TODO: validate headers (configurable?)
-	// TODO: validate file exists; is no directory; etc.
-	// TODO: determine the type of file requested (MUD vs. its signature)
-	// TODO: validate file has valid signature (configurable?)
-	// TODO: validate file is valid MUD (configurable?)
-	// TODO: respond with the file contents and set appropriate headers
+	contentType, err := m.detectContentType(filename)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return nil
+	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("HELLO from MUD File Server!"))
+	fmt.Println(contentType)
+
+	switch contentType {
+	case contentTypeSignature:
+		fmt.Println("send signature")
+	case contentTypeMUD:
+		if !m.validHeaders(r) {
+			w.WriteHeader(http.StatusBadRequest)
+			return nil
+		}
+		fmt.Println("send MUD")
+		// TODO: validate file is valid MUD (configurable?)
+		// TODO: validate file has valid signature (configurable? only when it's available in this server too?)
+	default:
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Println("can't send unknown/invalid content type")
+	}
+
+	file, err := m.openFile(filename)
+	if err != nil {
+		return m.notFound(w, r, next)
+	}
+	defer file.Close()
+
+	w.Header().Set("ETag", m.calculateETag(info))
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", string(contentType))
+	}
+
+	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
 
 	return nil
 }
@@ -88,12 +152,76 @@ func (m *FileServer) validHeaders(r *http.Request) bool {
 	return true
 }
 
-func contains(s []string, e string) bool {
-	e = strings.ToLower(e)
-	for _, a := range s {
-		if strings.ToLower(a) == e {
+// contains looks for a needle string in a haystack of strings
+func contains(haystack []string, needle string) bool {
+	needle = strings.ToLower(needle)
+	for _, a := range haystack {
+		if strings.ToLower(a) == needle {
 			return true
 		}
 	}
 	return false
+}
+
+// sanitizedPathJoin sanitizes the requested file path
+// and joins it to the (server) root
+//
+// source: Caddy
+func sanitizedPathJoin(root, reqPath string) string {
+
+	if root == "" {
+		root = "."
+	}
+
+	return filepath.Join(root, filepath.FromSlash(path.Clean("/"+reqPath)))
+}
+
+// notFound returns a 404 error or, if pass-thru is enabled,
+// it calls the next handler in the chain.
+//
+// source: Caddy
+func (m *FileServer) notFound(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+	return caddyhttp.Error(http.StatusNotFound, nil)
+}
+
+// detectContentType determines whether the requested file is a (potential) MUD file,
+// a (potential) MUD signature or something different.
+func (m *FileServer) detectContentType(path string) (contentType, error) {
+
+	contents, err := ioutil.ReadFile(path)
+	if err != nil {
+		// Any errors related to reading the file will be reported as an unknown filetype and err
+		return contentTypeUnknown, err
+	}
+
+	if _, err := pkcs7.Parse(contents); err == nil {
+		// if pkcs7 can parse without error, we assume this is a MUD signature file
+		return contentTypeSignature, nil
+	}
+
+	var data map[string]interface{}
+	if err := json.Unmarshal(contents, &data); err == nil {
+		// if the file can be unmarshalled as JSON, this may be a MUD file
+		return contentTypeMUD, nil
+	}
+
+	return contentTypeInvalid, nil
+}
+
+// openFile opens the file at the given filename.
+func (m *FileServer) openFile(filename string) (*os.File, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	return file, nil
+}
+
+// calculateEtag creates an ETag from file metadata in os.FileInfo
+//
+// source: Caddy
+func (m *FileServer) calculateETag(d os.FileInfo) string {
+	t := strconv.FormatInt(d.ModTime().Unix(), 36)
+	s := strconv.FormatInt(d.Size(), 36)
+	return `"` + t + s + `"`
 }
