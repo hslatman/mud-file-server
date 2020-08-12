@@ -2,7 +2,6 @@ package mud
 
 import (
 	"encoding/json"
-	"fmt"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -29,6 +28,10 @@ const (
 	contentTypeInvalid   contentType = "application/octet-stream"
 )
 
+const (
+	version string = "v0.1.0"
+)
+
 func init() {
 	caddy.RegisterModule(FileServer{})
 }
@@ -39,9 +42,14 @@ type FileServer struct {
 	// Default is `{http.vars.root}` if set; current working directory otherwise.
 	Root string `json:"root,omitempty"`
 	// Validate request headers according to https://www.rfc-editor.org/rfc/rfc8520
+	// Default is true
 	ValidateHeaders *bool `json:"validate_headers,omitempty"`
 	// Validate the requested MUD file (if it exists)
+	// Default is true
 	ValidateMUD *bool `json:"validate_mud,omitempty"`
+	// Set ETag header in responses
+	// Defaults is true
+	SetETag *bool `json:"set_etag,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -65,10 +73,7 @@ func (m *FileServer) Provision(ctx caddy.Context) error {
 // ServeHTTP is the core handler for the MUD File Server.
 func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 
-	w.Header().Set("server", "MUD File Server") // TODO: make this optional / configurable? Add version?
-
-	fmt.Println(r)
-	fmt.Println(r.URL.Path)
+	w.Header().Set("Server", "MUD File Server "+version+" (github.com/hslatman/mud-file-server)")
 
 	replacer := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
@@ -76,16 +81,12 @@ func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 	suffix := replacer.ReplaceAll(r.URL.Path, "")
 	filename := sanitizedPathJoin(root, suffix)
 
-	fmt.Println(filename)
-
 	// get information about the file
 	info, err := os.Stat(filename)
 	if err != nil {
 		// TODO: perform better checks? not exists vs permission error?
-		return m.notFound(w, r, next)
+		return m.notFound(w, r)
 	}
-
-	fmt.Println(info)
 
 	if info.IsDir() {
 		w.WriteHeader(http.StatusNotAcceptable)
@@ -97,8 +98,6 @@ func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		w.WriteHeader(http.StatusInternalServerError)
 		return nil
 	}
-
-	fmt.Println(contentType)
 
 	if contentType == contentTypeInvalid || contentType == contentTypeUnknown {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -112,25 +111,20 @@ func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		}
 		var ok bool
 		contentType, ok = m.validMUD(filename)
-		fmt.Println(contentType)
 		if !ok {
 			w.WriteHeader(http.StatusInternalServerError)
 			return nil
 		}
 	}
 
-	fmt.Println(contentType)
-
 	file, err := m.openFile(filename)
 	if err != nil {
-		return m.notFound(w, r, next)
+		return m.notFound(w, r)
 	}
 	defer file.Close()
 
-	w.Header().Set("ETag", m.calculateETag(info))
-	if w.Header().Get("Content-Type") == "" {
-		w.Header().Set("Content-Type", string(contentType))
-	}
+	m.setETag(w, info)
+	m.setContentType(w, contentType)
 
 	http.ServeContent(w, r, info.Name(), info.ModTime(), file)
 
@@ -179,6 +173,24 @@ func (m *FileServer) validMUD(path string) (contentType, bool) {
 	return contentTypeJSON, true
 }
 
+// setContentType sets the detected content type
+func (m *FileServer) setContentType(w http.ResponseWriter, ct contentType) {
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", string(ct))
+	}
+}
+
+// setETag sets an ETag based on an os.FileInfo object (if enabled)
+func (m *FileServer) setETag(w http.ResponseWriter, info os.FileInfo) {
+	if m.SetETag == nil || *m.SetETag {
+		// implementation taken from github.com/caddyserver/caddy/v2/modules/caddyhttp/fileserver/staticfiles.go
+		t := strconv.FormatInt(info.ModTime().Unix(), 36)
+		s := strconv.FormatInt(info.Size(), 36)
+		etag := `"` + t + s + `"`
+		w.Header().Set("ETag", etag)
+	}
+}
+
 // contains looks for a needle string in a haystack of strings
 func contains(haystack []string, needle string) bool {
 	needle = strings.ToLower(needle)
@@ -191,23 +203,20 @@ func contains(haystack []string, needle string) bool {
 }
 
 // sanitizedPathJoin sanitizes the requested file path
-// and joins it to the (server) root
+// and joins it to the (server) root directory
 //
-// source: Caddy
+// inspired by source: github.com/caddyserver/caddy/v2/modules/caddyhttp/fileserver/staticfiles.go
 func sanitizedPathJoin(root, reqPath string) string {
-
 	if root == "" {
 		root = "."
 	}
-
 	return filepath.Join(root, filepath.FromSlash(path.Clean("/"+reqPath)))
 }
 
-// notFound returns a 404 error or, if pass-thru is enabled,
-// it calls the next handler in the chain.
+// notFound returns a 404 error
 //
-// source: Caddy
-func (m *FileServer) notFound(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
+// inspired by source: github.com/caddyserver/caddy/v2/modules/caddyhttp/fileserver/staticfiles.go
+func (m *FileServer) notFound(w http.ResponseWriter, r *http.Request) error {
 	return caddyhttp.Error(http.StatusNotFound, nil)
 }
 
@@ -228,11 +237,11 @@ func (m *FileServer) detectContentType(path string) (contentType, error) {
 
 	var data map[string]interface{}
 	if err := json.Unmarshal(contents, &data); err == nil {
-		// if the file can be unmarshalled as JSON, this may be a MUD file
+		// if the file can be unmarshalled as JSON, this _MAY_ be a MUD file
 		return contentTypeJSON, nil
 	}
 
-	return contentTypeInvalid, nil // TODO: application/octet-stream?
+	return contentTypeInvalid, nil
 }
 
 // openFile opens the file at the given filename.
@@ -242,13 +251,4 @@ func (m *FileServer) openFile(filename string) (*os.File, error) {
 		return nil, err
 	}
 	return file, nil
-}
-
-// calculateEtag creates an ETag from file metadata in os.FileInfo
-//
-// source: Caddy
-func (m *FileServer) calculateETag(d os.FileInfo) string {
-	t := strconv.FormatInt(d.ModTime().Unix(), 36)
-	s := strconv.FormatInt(d.Size(), 36)
-	return `"` + t + s + `"`
 }

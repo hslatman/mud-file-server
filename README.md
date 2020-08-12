@@ -46,3 +46,4 @@ $ ./muds
 * Implement basic statistics about files requested?
 * More robust content type checking?
 * Decrease the Caddy footprint by importing only what we use
+* Add commands for signing / verifying MUD signatures? Or should that be part of mud.yang.go?
