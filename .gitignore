@@ -3,3 +3,10 @@ xcaddy
 caddy
 main
 muds
+
+# stuff related to example CA and example certificates
+*.crt
+*.srl
+*.key
+*.csr
+*.pem

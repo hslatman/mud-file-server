@@ -80,7 +80,7 @@ An example command invocation looks like this:
 
 ```bash
 # within the mud-file-server repository, assuming example certificates and keys are available
-$ openssl cms -sign -signer cert/example.crt -inkey cert/example.key -in examples/lightbulb2000.json -binary -outform DER -binary -certfile cert/intermediate.crt -out examples/lightbulb2000.json.p7s
+$ openssl cms -sign -signer cert/server.crt -inkey cert/server.key -in examples/lightbulb2000.json -binary -outform DER -binary -certfile cert/intermediate.crt -out examples/lightbulb2000.json.p7s
 ```
 
 Signatures can be checked as follows:
@@ -88,6 +88,25 @@ Signatures can be checked as follows:
 ```bash
 # within the mud-file-server repository, assuming the certificate that was used for signing the file is trusted
 $ openssl cms -verify -in examples/lightbulb2000.json.p7s -inform DER -content examples/lightbulb2000.json
+```
+
+### Example Certificates
+
+A small utility script for generating the keys and certificates for signing a MUD File has been included in this repository.
+It serves as an example; it probably shouldn't be used as is for production deployments.
+It can be used as follows:
+
+```bash
+# within the cert directory:
+$ ./new.sh
+```
+
+The certificate and key generated are directly under the newly generated CA, so no intermediates are included.
+The command for signing a MUD File using a key and certificate generated with the utility script should thus be changed to not include the intermediate certificate like below:
+
+```bash
+# within the mud-file-server repository, assuming example certificates and keys are available
+$ openssl cms -sign -signer cert/server.crt -inkey cert/server.key -in examples/lightbulb2000.json -binary -outform DER -binary -out examples/lightbulb2000.json.p7s
 ```
 
 ## Goal
