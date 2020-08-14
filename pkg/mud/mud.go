@@ -126,7 +126,7 @@ func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next cadd
 		var ok bool
 		contentType, ok = m.validMUD(filename)
 		if !ok {
-			w.WriteHeader(http.StatusInternalServerError)
+			w.WriteHeader(http.StatusInternalServerError) // TODO: a different return status?
 			return nil
 		}
 	}
