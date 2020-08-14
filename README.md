@@ -20,7 +20,7 @@ The module is available to be imported as follows:
 
 ```go
 import (
-    "github.com/hslatman/mud-file-server/pkg/mud".
+    _ "github.com/hslatman/mud-file-server/pkg/mud".
 )
 ```
 
@@ -29,28 +29,28 @@ This can be found in the `cmd` directory.
 
 ## Build
 
-Because the repository is currently private, we need to instruct Go that the module is private when trying to build a version of running the application:
+The MUD File Server binary can be built as shown below:
 
 ```bash
 # build the server 
-$ GOPRIVATE="github.com/hslatman/mud-file-server" go build cmd/main.go -o muds
+$ go build cmd/main.go -o muds
 ```
 
 ## Usage
 
 ```bash
 # run the server directly from Go code, using the provided config.json 
-$ GOPRIVATE="github.com/hslatman/mud-file-server" go run cmd/main.go run --config config.json
+$ go run cmd/main.go run --config config.json
 # run the server from compiled binary, using the provided config.json 
 $ ./muds run --config config.json
 ```
 
 Now the MUD File Server can be reached at https://localhost:9443/.
-Assuming the examples directory is available and the repository directory set as the root to serve files from, the example MUD file for `The BMS Example Light Bulb` should now be retrievable from:
+Assuming the examples directory is available and the repository directory set as the root to serve files from, the example MUD file for `The BMS Example Light Bulb` can now be retrieved from:
 
 https://localhost:9443/examples/lightbulb2000.json
 
-and its signature from:
+And its can be retrieved from signature from:
 
 https://localhost:9443/examples/lightbulb2000.json.p7s
 
@@ -118,12 +118,10 @@ Caddy was on my list of things to learn about and work with, so this little proj
 
 ## TODO
 
-* Add logging
-* Add example MUD including signature
+* Add logging using Caddy provided logger?
 * Do we need some kind of abstract file system handling?
-* Do we need a simple database?
 * Implement a simple overview page of MUDs available?
-* Implement a MUD viewer to open the visualize the available MUDs?
+* Implement a MUD viewer to visualize available MUDs?
 * Implement basic statistics about files requested?
 * More robust content type checking?
 * Add commands for signing / verifying MUD signatures? Or should that be part of mud.yang.go?
