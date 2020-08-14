@@ -11,10 +11,12 @@
     },
     "apps": {
       "http": {
+        "http_port": 9080,
+        "https_port": 9443,
         "servers": {
           "mud": {
             "listen": [
-              ":9090"
+              "127.0.0.1:9443"
             ],
             "routes": [
               {
@@ -36,6 +38,19 @@
             ],
             "logs": {}
           }
+        }
+      },
+      "tls": {
+        "automation": {
+          "policies": [
+            {
+              "subjects": ["localhost"],
+              "issuer":{
+                "module": "internal"
+              },
+              "on_demand": true
+            }
+          ]
         }
       }
     }
