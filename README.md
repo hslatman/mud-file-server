@@ -50,7 +50,7 @@ Assuming the examples directory is available and the repository directory set as
 
 https://localhost:9443/examples/lightbulb2000.json
 
-And its can be retrieved from signature from:
+And its signature can be retrieved from:
 
 https://localhost:9443/examples/lightbulb2000.json.p7s
 
