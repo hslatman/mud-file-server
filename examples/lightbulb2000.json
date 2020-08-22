@@ -1,11 +1,12 @@
 {
     "ietf-mud:mud": {
       "mud-version": 1,
-      "mud-url": "https://lighting.example.com/lightbulb2000",
+      "mud-url": "https://localhost:9443/examples/lightbulb2000.json",
       "last-update": "2019-01-28T11:20:51+01:00",
       "cache-validity": 48,
       "is-supported": true,
       "systeminfo": "The BMS Example Light Bulb",
+      "mud-signature": "https://localhost:9443/examples/lightbulb2000.json.p7s",
       "from-device-policy": {
         "access-lists": {
           "access-list": [

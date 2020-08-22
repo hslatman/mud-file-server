@@ -62,8 +62,11 @@ type FileServer struct {
 	// Default is true
 	ValidateMUD *bool `json:"validate_mud,omitempty"`
 	// Set ETag header in responses
-	// Defaults is true
+	// Default is true
 	SetETag *bool `json:"set_etag,omitempty"`
+	// Set the Server header to `MUD File Server`
+	// Default is true; if set to false, this will default to `Caddy`, unless overruled by the Caddy header module
+	SetMUDFileServerHeader *bool `json:"set_mud_file_server_header,omitempty"`
 }
 
 // CaddyModule returns the Caddy module information.
@@ -87,7 +90,7 @@ func (m *FileServer) Provision(ctx caddy.Context) error {
 // ServeHTTP is the core handler for the MUD File Server.
 func (m *FileServer) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 
-	w.Header().Set("Server", "MUD File Server "+version+" (github.com/hslatman/mud-file-server)")
+	m.setServerHeader(w)
 
 	replacer := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 
@@ -191,6 +194,13 @@ func (m *FileServer) validMUD(path string) (contentType, bool) {
 func (m *FileServer) setContentType(w http.ResponseWriter, ct contentType) {
 	if w.Header().Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", string(ct))
+	}
+}
+
+// setServerHeader sets the HTTP Server header to `MUD File Server`
+func (m *FileServer) setServerHeader(w http.ResponseWriter) {
+	if m.SetMUDFileServerHeader == nil || *m.SetMUDFileServerHeader {
+		w.Header().Set("Server", "MUD File Server "+version+" (github.com/hslatman/mud-file-server)")
 	}
 }
 

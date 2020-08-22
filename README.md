@@ -56,6 +56,8 @@ https://localhost:9443/examples/lightbulb2000.json.p7s
 
 Files that are invalid MUD Files or not parseable as CMS objects are not served by default.
 
+Please note that the lightbulb2000.json file has been changed slightly to reflect the fact that it has a MUD signature available for demo purposes.
+
 ### Configuration
 
 The MUD File Server module can be configured like any other Caddy module.
