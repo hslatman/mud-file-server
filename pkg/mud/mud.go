@@ -276,3 +276,9 @@ func (m *FileServer) openFile(filename string) (*os.File, error) {
 	}
 	return file, nil
 }
+
+var (
+	_ caddy.Module                = (*FileServer)(nil)
+	_ caddy.Provisioner           = (*FileServer)(nil)
+	_ caddyhttp.MiddlewareHandler = (*FileServer)(nil)
+)
