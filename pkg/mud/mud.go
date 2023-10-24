@@ -24,7 +24,7 @@ import (
 	"strconv"
 	"strings"
 
-	"go.mozilla.org/pkcs7"
+	"github.com/smallstep/pkcs7"
 
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"

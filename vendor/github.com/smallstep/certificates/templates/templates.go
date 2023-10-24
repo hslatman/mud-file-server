@@ -2,15 +2,15 @@ package templates
 
 import (
 	"bytes"
-	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"text/template"
 
 	"github.com/Masterminds/sprig/v3"
 	"github.com/pkg/errors"
-	"github.com/smallstep/cli/config"
-	"github.com/smallstep/cli/utils"
+	"go.step.sm/cli-utils/fileutil"
+	"go.step.sm/cli-utils/step"
 )
 
 // TemplateType defines how a template will be written in disk.
@@ -19,6 +19,9 @@ type TemplateType string
 const (
 	// Snippet will mark a template as a part of a file.
 	Snippet TemplateType = "snippet"
+	// PrependLine is a template for prepending a single line to a file. If the
+	// line already exists in the file it will be removed first.
+	PrependLine TemplateType = "prepend-line"
 	// File will mark a templates as a full file.
 	File TemplateType = "file"
 	// Directory will mark a template as a directory.
@@ -98,7 +101,7 @@ func (t *SSHTemplates) Validate() (err error) {
 	return
 }
 
-// Template represents on template file.
+// Template represents a template file.
 type Template struct {
 	*template.Template
 	Name         string       `json:"name"`
@@ -106,6 +109,7 @@ type Template struct {
 	TemplatePath string       `json:"template"`
 	Path         string       `json:"path"`
 	Comment      string       `json:"comment"`
+	RequiredData []string     `json:"requires,omitempty"`
 	Content      []byte       `json:"-"`
 }
 
@@ -116,8 +120,8 @@ func (t *Template) Validate() error {
 		return nil
 	case t.Name == "":
 		return errors.New("template name cannot be empty")
-	case t.Type != Snippet && t.Type != File && t.Type != Directory:
-		return errors.Errorf("invalid template type %s, it must be %s, %s, or %s", t.Type, Snippet, File, Directory)
+	case t.Type != Snippet && t.Type != File && t.Type != Directory && t.Type != PrependLine:
+		return errors.Errorf("invalid template type %s, it must be %s, %s, %s, or %s", t.Type, Snippet, PrependLine, File, Directory)
 	case t.TemplatePath == "" && t.Type != Directory && len(t.Content) == 0:
 		return errors.New("template template cannot be empty")
 	case t.TemplatePath != "" && t.Type == Directory:
@@ -130,7 +134,7 @@ func (t *Template) Validate() error {
 
 	if t.TemplatePath != "" {
 		// Check for file
-		st, err := os.Stat(config.StepAbs(t.TemplatePath))
+		st, err := os.Stat(step.Abs(t.TemplatePath))
 		if err != nil {
 			return errors.Wrapf(err, "error reading %s", t.TemplatePath)
 		}
@@ -147,14 +151,25 @@ func (t *Template) Validate() error {
 	return nil
 }
 
+// ValidateRequiredData checks that the given data contains all the keys
+// required.
+func (t *Template) ValidateRequiredData(data map[string]string) error {
+	for _, key := range t.RequiredData {
+		if _, ok := data[key]; !ok {
+			return errors.Errorf("required variable '%s' is missing", key)
+		}
+	}
+	return nil
+}
+
 // Load loads the template in memory, returns an error if the parsing of the
 // template fails.
 func (t *Template) Load() error {
 	if t.Template == nil && t.Type != Directory {
 		switch {
 		case t.TemplatePath != "":
-			filename := config.StepAbs(t.TemplatePath)
-			b, err := ioutil.ReadFile(filename)
+			filename := step.Abs(t.TemplatePath)
+			b, err := os.ReadFile(filename)
 			if err != nil {
 				return errors.Wrapf(err, "error reading %s", filename)
 			}
@@ -166,8 +181,11 @@ func (t *Template) Load() error {
 	return nil
 }
 
+// LoadBytes loads the template in memory, returns an error if the parsing of
+// the template fails.
 func (t *Template) LoadBytes(b []byte) error {
-	tmpl, err := template.New(t.Name).Funcs(sprig.TxtFuncMap()).Parse(string(b))
+	t.backfill(b)
+	tmpl, err := template.New(t.Name).Funcs(StepFuncMap()).Parse(string(b))
 	if err != nil {
 		return errors.Wrapf(err, "error parsing template %s", t.Name)
 	}
@@ -209,6 +227,17 @@ func (t *Template) Output(data interface{}) (Output, error) {
 	}, nil
 }
 
+// backfill updates old templates with the required data.
+func (t *Template) backfill(b []byte) {
+	if strings.EqualFold(t.Name, "sshd_config.tpl") && len(t.RequiredData) == 0 {
+		a := bytes.TrimSpace(b)
+		b := bytes.TrimSpace([]byte(DefaultSSHTemplateData[t.Name]))
+		if bytes.Equal(a, b) {
+			t.RequiredData = []string{"Certificate", "Key"}
+		}
+	}
+}
+
 // Output represents the text representation of a rendered template.
 type Output struct {
 	Name    string       `json:"name"`
@@ -220,7 +249,10 @@ type Output struct {
 
 // Write writes the Output to the filesystem as a directory, file or snippet.
 func (o *Output) Write() error {
-	path := config.StepAbs(o.Path)
+	// Replace ${STEPPATH} with the base step path.
+	o.Path = strings.ReplaceAll(o.Path, "${STEPPATH}", step.BasePath())
+
+	path := step.Abs(o.Path)
 	if o.Type == Directory {
 		return mkdir(path, 0700)
 	}
@@ -230,11 +262,17 @@ func (o *Output) Write() error {
 		return err
 	}
 
-	if o.Type == File {
-		return utils.WriteFile(path, o.Content, 0600)
+	switch o.Type {
+	case File:
+		return fileutil.WriteFile(path, o.Content, 0600)
+	case Snippet:
+		return fileutil.WriteSnippet(path, o.Content, 0600)
+	case PrependLine:
+		return fileutil.PrependLine(path, o.Content, 0600)
+	default:
+		// Default to using a Snippet type if the type is not known.
+		return fileutil.WriteSnippet(path, o.Content, 0600)
 	}
-
-	return utils.WriteSnippet(path, o.Content, 0600)
 }
 
 func mkdir(path string, perm os.FileMode) error {
@@ -242,4 +280,13 @@ func mkdir(path string, perm os.FileMode) error {
 		return errors.Wrapf(err, "error creating %s", path)
 	}
 	return nil
+}
+
+// StepFuncMap returns sprig.TxtFuncMap but removing the "env" and "expandenv"
+// functions to avoid any leak of information.
+func StepFuncMap() template.FuncMap {
+	m := sprig.TxtFuncMap()
+	delete(m, "env")
+	delete(m, "expandenv")
+	return m
 }

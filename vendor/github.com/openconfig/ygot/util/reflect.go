@@ -19,7 +19,6 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/google/go-cmp/cmp"
 	"github.com/kylelemons/godebug/pretty"
 	"github.com/openconfig/goyang/pkg/yang"
 
@@ -379,7 +378,7 @@ func InsertIntoMapStructField(parentStruct interface{}, fieldName string, key, f
 // If the field is a slice, no need to initialize as appending a new element
 // will do the same thing. Note that if the field is initialized already, this
 // function doesn't re-initialize it.
-func InitializeStructField(parent interface{}, fieldName string) error {
+func InitializeStructField(parent interface{}, fieldName string, initializeLeafs bool) error {
 	if parent == nil {
 		return errors.New("parent is nil")
 	}
@@ -398,7 +397,9 @@ func InitializeStructField(parent interface{}, fieldName string) error {
 	}
 	switch {
 	case IsValuePtr(fV) && fV.IsNil():
-		fV.Set(reflect.New(fV.Type().Elem()))
+		if v := reflect.New(fV.Type().Elem()); initializeLeafs || !IsValueScalar(v) {
+			fV.Set(v)
+		}
 	case IsValueMap(fV) && fV.IsNil():
 		fV.Set(reflect.MakeMap(fV.Type()))
 	}
@@ -449,18 +450,40 @@ func DeepEqualDerefPtrs(a, b interface{}) bool {
 	if !IsValueNil(b) && reflect.TypeOf(b).Kind() == reflect.Ptr {
 		bb = reflect.ValueOf(b).Elem().Interface()
 	}
-	return cmp.Equal(aa, bb)
+	return reflect.DeepEqual(aa, bb)
 }
 
 // ChildSchema returns the schema for the struct field f, if f contains a valid
 // path tag and the schema path is found in the schema tree. It returns an error
 // if the struct tag is invalid, or nil if tag is valid but the schema is not
 // found in the tree at the specified path.
-// TODO(wenbli): need unit test
 func ChildSchema(schema *yang.Entry, f reflect.StructField) (*yang.Entry, error) {
+	return childSchema(schema, f, false)
+}
+
+// ChildSchemaPreferShadow returns the shadow schema (if exists) or schema for
+// the struct field f, if f contains a valid "shadow-path" or "path" tag and
+// the schema path is found in the schema tree. It returns an error if the
+// struct tag is invalid, or nil if tag is valid but the schema is not found in
+// the tree at the specified path.
+func ChildSchemaPreferShadow(schema *yang.Entry, f reflect.StructField) (*yang.Entry, error) {
+	return childSchema(schema, f, true)
+}
+
+// childSchema returns the schema for the struct field f, if f contains a valid
+// path tag and the schema path is found in the schema tree. It returns an error
+// if the struct tag is invalid, or nil if tag is valid but the schema is not
+// found in the tree at the specified path.
+//
+// If preferShadowPath is false, the path values from the "path" tag are used.
+// If preferShadowPath is true and the field has a "shadow-path" tag, then the
+// path values from the "shadow-path" tag are used; if the field doesn't have
+// the "shadow-path" tag, then the path values from the "path" tag are used.
+func childSchema(schema *yang.Entry, f reflect.StructField, preferShadowPath bool) (*yang.Entry, error) {
 	pathTag, _ := f.Tag.Lookup("path")
-	DbgSchema("childSchema for schema %s, field %s, tag %s\n", schema.Name, f.Name, pathTag)
-	p, err := RelativeSchemaPath(f)
+	shadowPathTag, _ := f.Tag.Lookup("shadow-path")
+	DbgSchema("childSchema for schema %s, field %s, path tag %s, shadow-path tag\n", schema.Name, f.Name, pathTag, shadowPathTag)
+	p, err := relativeSchemaPath(f, preferShadowPath)
 	if err != nil {
 		return nil, err
 	}
@@ -586,10 +609,30 @@ func (node *PathQueryNodeMemo) GetRoot() *PathQueryNodeMemo {
 }
 
 // FieldIteratorFunc is an iteration function for arbitrary field traversals.
-// in, out are passed through from the caller to the iteration vistior function
+// in, out are passed through from the caller to the iteration visitor function
 // and can be used to pass state in and out. They are not otherwise touched.
 // It returns a slice of errors encountered while processing the field.
-type FieldIteratorFunc func(ni *NodeInfo, in, out interface{}) Errors
+type FieldIteratorFunc func(ni *NodeInfo, in, out any) Errors
+
+// IterationAction is an enumeration representing different iteration actions.
+//
+//go:generate stringer -type=IterationAction
+type IterationAction uint
+
+const (
+	// ContinueIteration means to continue the preorder traversal.
+	ContinueIteration = IterationAction(iota)
+	// DoNotIterateDescendants means to continue traversal but skip the
+	// descendant elements of this subtree node.
+	DoNotIterateDescendants
+)
+
+// FieldIteratorFunc2 is an iteration function for arbitrary field traversals.
+// in, out are passed through from the caller to the iteration visitor function
+// and can be used to pass state in and out. They are not otherwise touched.
+// It returns what next iteration action to take as well as an error.
+// TODO Deprecate the ForEachField and ForEachDataField functions in favor of Walk.
+type FieldIteratorFunc2 func(ni *NodeInfo, in, out any) (IterationAction, Errors)
 
 // ForEachField recursively iterates through the fields of value (which may be
 // any Go type) and executes iterFunction on each field. Any nil fields
@@ -598,180 +641,93 @@ type FieldIteratorFunc func(ni *NodeInfo, in, out interface{}) Errors
 // leafref. Fields that are present in value that are explicitly noted not to
 // have a corresponding schema (e.g., annotation/metadata fields added by ygen)
 // are skipped during traversal.
-//   schema is the schema corresponding to value.
-//   in, out are passed to the iterator function and can be used to carry state
-//     and return results from the iterator.
-//   iterFunction is executed on each scalar field.
+//
+// - schema is the schema corresponding to value.
+// - in, out are passed to the iterator function and can be used to carry state
+// and return results from the iterator.
+// - iterFunction is executed on each scalar field.
+//
 // It returns a slice of errors encountered while processing the struct.
-func ForEachField(schema *yang.Entry, value interface{}, in, out interface{}, iterFunction FieldIteratorFunc) Errors {
+//
+// See util.Walk if more dynamic control of the traversal is needed.
+func ForEachField(schema *yang.Entry, value any, in, out any, iterFunction FieldIteratorFunc) Errors {
 	if IsValueNil(value) {
 		return nil
 	}
-	return forEachFieldInternal(&NodeInfo{Schema: schema, FieldValue: reflect.ValueOf(value)}, in, out, iterFunction)
+	var v Visitor
+	errCollector := new(DefaultWalkErrors)
+	if inMemo, ok := in.(*PathQueryNodeMemo); ok {
+		v = forEachFieldMemoVisitor{
+			// Any existing Memo map passed in will be ignored.
+			parent:         inMemo.Parent,
+			out:            out,
+			iterFunction:   iterFunction,
+			errorCollector: errCollector,
+		}
+	} else {
+		v = &forEachFieldVisitor{
+			in:             in,
+			out:            out,
+			iterFunction:   iterFunction,
+			errorCollector: errCollector,
+		}
+	}
+
+	// For back-compatibility with ForFieldField, we explicitly interleave the errors from
+	// both the traversal and the iterFunction into the shared Errors slice.
+	_ = Walk(v, WalkNodeFromGoStruct(value), DefaultWalkOptions().WithWalkErrors(errCollector).WithSchema(schema))
+	// We ignore the returned WalkErrors because we know it's a reference to v.errorCollector.
+	return errCollector.Errors
 }
 
-// forEachFieldInternal recursively iterates through the fields of value (which
-// may be any Go type) and executes iterFunction on each field that is present
-// within the supplied schema. Fields that are explicitly noted not to have
-// a schema (e.g., annotation fields) are skipped.
-//   in, out are passed through from the caller to the iteration and can be used
-//     arbitrarily in the iteration function to carry state and results.
-func forEachFieldInternal(ni *NodeInfo, in, out interface{}, iterFunction FieldIteratorFunc) Errors {
-	if IsValueNil(ni) {
+// iterFuncToIterFunc2 converts a FieldIteratorFunc to FieldIteratorFunc2.
+func iterFuncToIterFunc2(iterFunction FieldIteratorFunc) FieldIteratorFunc2 {
+	return func(ni *NodeInfo, in, out any) (IterationAction, Errors) {
+		return ContinueIteration, iterFunction(ni, in, out)
+	}
+}
+
+type forEachFieldVisitor struct {
+	in, out        any
+	errorCollector *DefaultWalkErrors
+	iterFunction   FieldIteratorFunc
+}
+
+func (vf *forEachFieldVisitor) Visit(node WalkNode) Visitor {
+	if node == nil {
 		return nil
 	}
+	ni := node.NodeInfo()
+	if err := vf.iterFunction(ni, vf.in, vf.out); err != nil {
+		vf.errorCollector.Collect(err)
+	}
+	return vf
+}
 
-	// If the field is an annotation, then we do not process it any further, including
-	// skipping running the iterFunction.
-	if IsYgotAnnotation(ni.StructField) {
+type forEachFieldMemoVisitor struct {
+	parent         *PathQueryNodeMemo
+	out            any
+	errorCollector *DefaultWalkErrors
+	iterFunction   FieldIteratorFunc
+}
+
+func (vf forEachFieldMemoVisitor) Visit(node WalkNode) Visitor {
+	if node == nil {
 		return nil
 	}
-
-	var errs Errors
-	errs = AppendErrs(errs, iterFunction(ni, in, out))
-
-	// Special processing where an "in" input value is provided.
-	var newPathQueryMemo func() *PathQueryNodeMemo
-	switch v := in.(type) {
-	case *PathQueryNodeMemo: // Memoization of path queries requested.
-		newPathQueryMemo = func() *PathQueryNodeMemo {
-			return &PathQueryNodeMemo{Parent: v, Memo: PathQueryMemo{}}
-		}
-	default:
+	// Each children sibling needs a dedicated (not shared) Memo data structure (map).
+	in := &PathQueryNodeMemo{
+		Parent: vf.parent,
+		Memo:   PathQueryMemo{},
 	}
-
-	v := ni.FieldValue
-	t := v.Type()
-
-	switch {
-	case IsTypeStructPtr(t):
-		t = t.Elem()
-		if !IsNilOrInvalidValue(v) {
-			v = v.Elem()
-		}
-		fallthrough
-	case IsTypeStruct(t):
-		for i := 0; i < t.NumField(); i++ {
-			sf := t.Field(i)
-
-			// Do not handle annotation fields, since they have no schema.
-			if IsYgotAnnotation(sf) {
-				continue
-			}
-
-			nn := &NodeInfo{
-				Parent:      ni,
-				StructField: sf,
-				FieldValue:  reflect.Zero(sf.Type),
-			}
-			if !IsNilOrInvalidValue(v) {
-				nn.FieldValue = v.Field(i)
-			}
-			ps, err := SchemaPaths(nn.StructField)
-			if err != nil {
-				return NewErrs(err)
-			}
-
-			for _, p := range ps {
-				nn.Schema = FirstChild(ni.Schema, p)
-				if nn.Schema == nil {
-					e := fmt.Errorf("forEachFieldInternal could not find child schema with path %v from schema name %s", p, ni.Schema.Name)
-					DbgPrint(e.Error())
-					log.Errorln(e)
-					continue
-				}
-				nn.PathFromParent = p
-				// In the case of a map/slice, the path is of the form
-				// "container/element" in the compressed schema, so trim off
-				// any extra path elements in this case.
-				if IsTypeSlice(sf.Type) || IsTypeMap(sf.Type) {
-					nn.PathFromParent = p[0:1]
-				}
-				switch in.(type) {
-				case *PathQueryNodeMemo: // Memoization of path queries requested.
-					errs = AppendErrs(errs, forEachFieldInternal(nn, newPathQueryMemo(), out, iterFunction))
-				default:
-					errs = AppendErrs(errs, forEachFieldInternal(nn, in, out, iterFunction))
-				}
-			}
-		}
-
-	case IsTypeSlice(t):
-		// Leaf-list elements share the parent schema with listattr unset.
-		schema := *(ni.Schema)
-		schema.ListAttr = nil
-		var pp []string
-		if !schema.IsLeafList() {
-			pp = []string{schema.Name}
-		}
-		if IsNilOrInvalidValue(v) {
-			// Traverse the type tree only from this point.
-			nn := &NodeInfo{
-				Parent:         ni,
-				PathFromParent: pp,
-				Schema:         &schema,
-				FieldValue:     reflect.Zero(t.Elem()),
-			}
-			switch in.(type) {
-			case *PathQueryNodeMemo: // Memoization of path queries requested.
-				errs = AppendErrs(errs, forEachFieldInternal(nn, newPathQueryMemo(), out, iterFunction))
-			default:
-				errs = AppendErrs(errs, forEachFieldInternal(nn, in, out, iterFunction))
-			}
-		} else {
-			for i := 0; i < ni.FieldValue.Len(); i++ {
-				nn := *ni
-				// The schema for each element is the list schema minus the list
-				// attrs.
-				nn.Schema = &schema
-				nn.Parent = ni
-				nn.PathFromParent = pp
-				nn.FieldValue = ni.FieldValue.Index(i)
-				switch in.(type) {
-				case *PathQueryNodeMemo: // Memoization of path queries requested.
-					errs = AppendErrs(errs, forEachFieldInternal(&nn, newPathQueryMemo(), out, iterFunction))
-				default:
-					errs = AppendErrs(errs, forEachFieldInternal(&nn, in, out, iterFunction))
-				}
-			}
-		}
-
-	case IsTypeMap(t):
-		schema := *(ni.Schema)
-		schema.ListAttr = nil
-		if IsNilOrInvalidValue(v) {
-			nn := &NodeInfo{
-				Parent:         ni,
-				PathFromParent: []string{schema.Name},
-				Schema:         &schema,
-				FieldValue:     reflect.Zero(t.Elem()),
-			}
-			switch in.(type) {
-			case *PathQueryNodeMemo: // Memoization of path queries requested.
-				errs = AppendErrs(errs, forEachFieldInternal(nn, newPathQueryMemo(), out, iterFunction))
-			default:
-				errs = AppendErrs(errs, forEachFieldInternal(nn, in, out, iterFunction))
-			}
-		} else {
-			for _, key := range ni.FieldValue.MapKeys() {
-				nn := *ni
-				nn.Schema = &schema
-				nn.Parent = ni
-				nn.PathFromParent = []string{schema.Name}
-				nn.FieldValue = ni.FieldValue.MapIndex(key)
-				nn.FieldKey = key
-				nn.FieldKeys = ni.FieldValue.MapKeys()
-				switch in.(type) {
-				case *PathQueryNodeMemo: // Memoization of path queries requested.
-					errs = AppendErrs(errs, forEachFieldInternal(&nn, newPathQueryMemo(), out, iterFunction))
-				default:
-					errs = AppendErrs(errs, forEachFieldInternal(&nn, in, out, iterFunction))
-				}
-			}
-		}
+	ni := node.NodeInfo()
+	if err := vf.iterFunction(ni, in, vf.out); err != nil {
+		vf.errorCollector.Collect(err)
 	}
-
-	return errs
+	// Since we use a value receiver vf instead of a pointer receiver,
+	// vf is passed as a copy and it's safe to manipulate.
+	vf.parent = in
+	return vf
 }
 
 // ForEachDataField iterates the value supplied and calls the iterFunction for
@@ -779,108 +735,65 @@ func forEachFieldInternal(ni *NodeInfo, in, out interface{}, iterFunction FieldI
 // to perform the iteration. The in and out arguments are passed to the iterFunction
 // without inspection by this function, and can be used by the caller to store
 // input and output during the iteration through the data tree.
-func ForEachDataField(value, in, out interface{}, iterFunction FieldIteratorFunc) Errors {
+//
+// Deprecated: Use ForEachDataField2 or util.Walk instead.
+func ForEachDataField(value, in, out any, iterFunction FieldIteratorFunc) Errors {
 	if IsValueNil(value) {
 		return nil
 	}
 
-	return forEachDataFieldInternal(&NodeInfo{FieldValue: reflect.ValueOf(value)}, in, out, iterFunction)
+	return ForEachDataField2(value, in, out, iterFuncToIterFunc2(iterFunction))
 }
 
-func forEachDataFieldInternal(ni *NodeInfo, in, out interface{}, iterFunction FieldIteratorFunc) Errors {
-	if IsValueNil(ni) {
+// ForEachDataField2 is an improved ForEachDataField that allows iteration over
+// the data tree in the supplied value with custom iteration behaviour at each
+// iteration step.
+//
+// ForEachDataField2 calls iterFunction for each data tree node found in the
+// supplied value. No schema information is required to perform the iteration.
+// The in and out arguments are passed to the iterFunction without inspection
+// by this function, and can be used by the caller to store input and output
+// during the iteration through the data tree.
+//
+// See util.Walk if more dynamic control of the traversal is needed.
+func ForEachDataField2(value, in, out any, iterFunction FieldIteratorFunc2) Errors {
+	if IsValueNil(value) {
 		return nil
 	}
+	errCollector := new(DefaultWalkErrors)
+	v := &forEachDataField2Visitor{
+		in:             in,
+		out:            out,
+		iterFunction2:  iterFunction,
+		errorCollector: errCollector,
+	}
+	// For back-compatibility with ForFieldField, we explicitly interleave the errors from
+	// both the traversal and the iterFunction into the shared Errors slice.
+	_ = Walk(v, WalkNodeFromGoStruct(value), DefaultWalkOptions().WithWalkErrors(errCollector))
+	// We ignore the returned WalkErrors because we know it's a reference to v.errorCollector.
+	return errCollector.Errors
+}
 
-	if IsNilOrInvalidValue(ni.FieldValue) {
-		// Skip any fields that are nil within the data tree, since we
-		// do not need to iterate on them.
+type forEachDataField2Visitor struct {
+	in, out        any
+	errorCollector *DefaultWalkErrors
+	iterFunction2  FieldIteratorFunc2
+}
+
+func (vf *forEachDataField2Visitor) Visit(node WalkNode) Visitor {
+	if node == nil {
 		return nil
 	}
-
-	var errs Errors
-	// Run the iterator function for this field.
-	errs = AppendErrs(errs, iterFunction(ni, in, out))
-
-	v := ni.FieldValue
-	t := v.Type()
-
-	// Determine whether we need to recurse into the field, or whether it is
-	// a leaf or leaf-list, which are not recursed into when traversing the
-	// data tree.
-	switch {
-	case IsTypeStructPtr(t):
-		// A struct pointer in a GoStruct is a pointer to another container within
-		// the YANG, therefore we dereference the pointer and then recurse. If the
-		// pointer is nil, then we do not need to do this since the data tree branch
-		// is unset in the schema.
-		t = t.Elem()
-		v = v.Elem()
-		fallthrough
-	case IsTypeStruct(t):
-		// Handle non-pointer structs by recursing into each field of the struct.
-		for i := 0; i < t.NumField(); i++ {
-			sf := t.Field(i)
-			nn := &NodeInfo{
-				Parent:      ni,
-				StructField: sf,
-				FieldValue:  reflect.Zero(sf.Type),
-			}
-
-			nn.FieldValue = v.Field(i)
-			ps, err := SchemaPaths(nn.StructField)
-			if err != nil {
-				return NewErrs(err)
-			}
-			// In the case that the field expands to >1 different data tree path,
-			// i.e., SchemaPaths above returns more than one path, then we recurse
-			// for each schema path. This ensures that the iterator
-			// function runs for all expansions of the data tree as well as the GoStruct
-			// fields.
-			for _, p := range ps {
-				nn.PathFromParent = p
-				if IsTypeSlice(sf.Type) || IsTypeMap(sf.Type) {
-					// Since lists can have path compression - where the path contains more
-					// than one element, ensure that the schema path we received is only two
-					// elements long. This protects against compression errors where there are
-					// trailing spaces (e.g., a path tag of config/bar/).
-					nn.PathFromParent = p[0:1]
-				}
-				errs = AppendErrs(errs, forEachDataFieldInternal(nn, in, out, iterFunction))
-			}
-		}
-	case IsTypeSlice(t):
-		// Only iterate in the data tree if the slice is of structs, otherwise
-		// for leaf-lists we only run once.
-		if !IsTypeStructPtr(t.Elem()) && !IsTypeStruct(t.Elem()) {
-			return errs
-		}
-
-		for i := 0; i < ni.FieldValue.Len(); i++ {
-			nn := *ni
-			nn.Parent = ni
-			// The name of the list is the same in each of the entries within the
-			// list therefore, we do not need to set the path to be different from
-			// the parent.
-			nn.PathFromParent = ni.PathFromParent
-			nn.FieldValue = ni.FieldValue.Index(i)
-			errs = AppendErrs(errs, forEachDataFieldInternal(&nn, in, out, iterFunction))
-		}
-	case IsTypeMap(t):
-		// Handle the case of a keyed map, which is a YANG list.
-		if IsNilOrInvalidValue(v) {
-			return errs
-		}
-		for _, key := range ni.FieldValue.MapKeys() {
-			nn := *ni
-			nn.Parent = ni
-			nn.FieldValue = ni.FieldValue.MapIndex(key)
-			nn.FieldKey = key
-			nn.FieldKeys = ni.FieldValue.MapKeys()
-			errs = AppendErrs(errs, forEachDataFieldInternal(&nn, in, out, iterFunction))
-		}
+	ni := node.NodeInfo()
+	action, err := vf.iterFunction2(ni, vf.in, vf.out)
+	if err != nil {
+		vf.errorCollector.Collect(err)
 	}
-	return errs
+	vf.errorCollector.Errors = AppendErrs(vf.errorCollector.Errors, err)
+	if action == DoNotIterateDescendants {
+		return nil
+	}
+	return vf
 }
 
 // GetNodes returns the nodes in the data tree at the indicated path, relative
@@ -892,6 +805,9 @@ func forEachDataFieldInternal(ni *NodeInfo, in, out interface{}, iterFunction Fi
 // If the root is the tree root, the path may be absolute.
 // GetNodes returns an error if the path is not found in the tree, or an element
 // along the path is nil.
+//
+// Deprecated: Use ytypes.GetNode with the option &ytypes.GetPartialKeyMatch{}
+// and &ytypes.GetTolerateNil{} instead.
 func GetNodes(schema *yang.Entry, root interface{}, path *gpb.Path) ([]interface{}, []*yang.Entry, error) {
 	return getNodesInternal(schema, root, path)
 }
@@ -1044,11 +960,12 @@ func getNodesList(schema *yang.Entry, root interface{}, path *gpb.Path) ([]inter
 					if !fv.IsValid() {
 						return nil, nil, fmt.Errorf("element struct type %s does not contain key field %s", k.Type(), kfn)
 					}
-					nv := fv
-					if fv.Type().Kind() == reflect.Ptr {
-						// Ptr values are deferenced in key struct.
-						nv = nv.Elem()
-					}
+					// FIXME(wenbli): This block was here but is not doing anything. We need to ensure that no functionality would be missing by removing it.
+					//nv := fv
+					//if fv.Type().Kind() == reflect.Ptr {
+					//	// Ptr values are deferenced in key struct.
+					//	nv = nv.Elem()
+					//}
 					kf, ok := listElementType.FieldByName(kfn)
 					if !ok {
 						return nil, nil, fmt.Errorf("element struct type %s does not contain key field %s", k.Type(), kfn)

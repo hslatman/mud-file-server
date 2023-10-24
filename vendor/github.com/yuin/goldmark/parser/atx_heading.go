@@ -13,7 +13,7 @@ type HeadingConfig struct {
 }
 
 // SetOption implements SetOptioner.
-func (b *HeadingConfig) SetOption(name OptionName, value interface{}) {
+func (b *HeadingConfig) SetOption(name OptionName, _ interface{}) {
 	switch name {
 	case optAutoHeadingID:
 		b.AutoHeadingID = true
@@ -91,6 +91,9 @@ func (b *atxHeadingParser) Open(parent ast.Node, reader text.Reader, pc Context)
 	if i == pos || level > 6 {
 		return nil, NoChildren
 	}
+	if i == len(line) { // alone '#' (without a new line character)
+		return ast.NewHeading(level), NoChildren
+	}
 	l := util.TrimLeftSpaceLength(line[i:])
 	if l == 0 {
 		return nil, NoChildren
@@ -132,7 +135,9 @@ func (b *atxHeadingParser) Open(parent ast.Node, reader text.Reader, pc Context)
 				for _, attr := range attrs {
 					node.SetAttribute(attr.Name, attr.Value)
 				}
-				node.Lines().Append(text.NewSegment(segment.Start+start+1-segment.Padding, segment.Start+closureOpen-segment.Padding))
+				node.Lines().Append(text.NewSegment(
+					segment.Start+start+1-segment.Padding,
+					segment.Start+closureOpen-segment.Padding))
 			}
 		}
 	}

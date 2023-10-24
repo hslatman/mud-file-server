@@ -21,6 +21,7 @@ import (
 	"strconv"
 
 	"github.com/openconfig/goyang/pkg/yang"
+	"github.com/openconfig/ygot/internal/yreflect"
 	"github.com/openconfig/ygot/util"
 	"github.com/openconfig/ygot/ygot"
 
@@ -125,9 +126,9 @@ func castToEnumValue(ft reflect.Type, value string) (interface{}, error) {
 	}
 
 	util.DbgPrint("checking for matching enum value for type %s", ft)
-	mapMethod := reflect.New(ft).MethodByName("ΛMap")
-	if !mapMethod.IsValid() {
-		return 0, fmt.Errorf("%s does not have a ΛMap function", ft)
+	mapMethod, err := yreflect.MethodByName(reflect.New(ft), "ΛMap")
+	if err != nil {
+		return 0, err
 	}
 
 	ec := mapMethod.Call(nil)
@@ -227,7 +228,7 @@ func stringToKeyType(schema *yang.Entry, parent interface{}, fieldName string, v
 	switch ykind {
 	// TODO(wenbli): case yang.Ybits:
 	case yang.Yint64, yang.Yint32, yang.Yint16, yang.Yint8:
-		bits, err := yangIntTypeBits(ykind)
+		bits, err := util.YangIntTypeBits(ykind)
 		if err != nil {
 			return reflect.ValueOf(nil), err
 		}
@@ -240,7 +241,7 @@ func stringToKeyType(schema *yang.Entry, parent interface{}, fieldName string, v
 		// Convert fails here.
 		return reflect.ValueOf(u).Convert(reflect.TypeOf(yangBuiltinTypeToGoType(ykind))), nil
 	case yang.Yuint64, yang.Yuint32, yang.Yuint16, yang.Yuint8:
-		bits, err := yangIntTypeBits(ykind)
+		bits, err := util.YangIntTypeBits(ykind)
 		if err != nil {
 			return reflect.ValueOf(nil), err
 		}
@@ -345,22 +346,6 @@ func stringToUnionType(schema *yang.Entry, parent interface{}, fieldName string,
 	}
 
 	return reflect.ValueOf(nil), fmt.Errorf("could not find suitable union type to unmarshal value %q into parent struct type %T field %s", value, parent, fieldName)
-}
-
-// yangIntTypeBits returns the number of bits for a YANG int type.
-// It returns an error if the type is not an int type.
-func yangIntTypeBits(t yang.TypeKind) (int, error) {
-	switch t {
-	case yang.Yint8, yang.Yuint8:
-		return 8, nil
-	case yang.Yint16, yang.Yuint16:
-		return 16, nil
-	case yang.Yint32, yang.Yuint32:
-		return 32, nil
-	case yang.Yint64, yang.Yuint64:
-		return 64, nil
-	}
-	return 0, fmt.Errorf("type is not an int")
 }
 
 // yangBuiltinTypeToGoType returns a pointer to the Go built-in value with

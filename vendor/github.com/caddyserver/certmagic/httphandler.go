@@ -15,12 +15,11 @@
 package certmagic
 
 import (
-	"encoding/json"
-	"log"
 	"net/http"
 	"strings"
 
-	"github.com/go-acme/lego/v3/challenge/http01"
+	"github.com/mholt/acmez/acme"
+	"go.uber.org/zap"
 )
 
 // HTTPChallengeHandler wraps h in a handler that can solve the ACME
@@ -29,7 +28,7 @@ import (
 // the challenge state is stored between initiation and solution.
 //
 // If a request is not an ACME HTTP challenge, h will be invoked.
-func (am *ACMEManager) HTTPChallengeHandler(h http.Handler) http.Handler {
+func (am *ACMEIssuer) HTTPChallengeHandler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if am.HandleHTTPChallenge(w, r) {
 			return
@@ -50,7 +49,7 @@ func (am *ACMEManager) HTTPChallengeHandler(h http.Handler) http.Handler {
 // It returns true if it handled the request; if so, the response has
 // already been written. If false is returned, this call was a no-op and
 // the request has not been handled.
-func (am *ACMEManager) HandleHTTPChallenge(w http.ResponseWriter, r *http.Request) bool {
+func (am *ACMEIssuer) HandleHTTPChallenge(w http.ResponseWriter, r *http.Request) bool {
 	if am == nil {
 		return false
 	}
@@ -67,47 +66,51 @@ func (am *ACMEManager) HandleHTTPChallenge(w http.ResponseWriter, r *http.Reques
 // request was initiated by this or another instance which uses the
 // same storage as am does, and attempts to complete the challenge for
 // it. It returns true if the request was handled; false otherwise.
-func (am *ACMEManager) distributedHTTPChallengeSolver(w http.ResponseWriter, r *http.Request) bool {
+func (am *ACMEIssuer) distributedHTTPChallengeSolver(w http.ResponseWriter, r *http.Request) bool {
 	if am == nil {
 		return false
 	}
-
 	host := hostOnly(r.Host)
-
-	tokenKey := distributedSolver{acmeManager: am, caURL: am.CA}.challengeTokensKey(host)
-	chalInfoBytes, err := am.config.Storage.Load(tokenKey)
+	chalInfo, distributed, err := am.config.getChallengeInfo(r.Context(), host)
 	if err != nil {
-		if _, ok := err.(ErrNotExist); !ok {
-			log.Printf("[ERROR][%s] Opening distributed HTTP challenge token file: %v", host, err)
-		}
+		am.Logger.Error("looking up info for HTTP challenge",
+			zap.String("host", host),
+			zap.String("remote_addr", r.RemoteAddr),
+			zap.String("user_agent", r.Header.Get("User-Agent")),
+			zap.Error(err))
 		return false
 	}
-
-	var chalInfo challengeInfo
-	err = json.Unmarshal(chalInfoBytes, &chalInfo)
-	if err != nil {
-		log.Printf("[ERROR][%s] Decoding challenge token file %s (corrupted?): %v", host, tokenKey, err)
-		return false
-	}
-
-	return answerHTTPChallenge(w, r, chalInfo)
+	return solveHTTPChallenge(am.Logger, w, r, chalInfo.Challenge, distributed)
 }
 
-// answerHTTPChallenge solves the challenge with chalInfo.
-// Most of this code borrowed from xenolf/lego's built-in HTTP-01
-// challenge solver in March 2018.
-func answerHTTPChallenge(w http.ResponseWriter, r *http.Request, chalInfo challengeInfo) bool {
-	challengeReqPath := http01.ChallengePath(chalInfo.Token)
+// solveHTTPChallenge solves the HTTP challenge using the given challenge information.
+// If the challenge is being solved in a distributed fahsion, set distributed to true for logging purposes.
+// It returns true the properties of the request check out in relation to the HTTP challenge.
+// Most of this code borrowed from xenolf's built-in HTTP-01 challenge solver in March 2018.
+func solveHTTPChallenge(logger *zap.Logger, w http.ResponseWriter, r *http.Request, challenge acme.Challenge, distributed bool) bool {
+	challengeReqPath := challenge.HTTP01ResourcePath()
 	if r.URL.Path == challengeReqPath &&
-		strings.EqualFold(hostOnly(r.Host), chalInfo.Domain) && // mitigate DNS rebinding attacks
+		strings.EqualFold(hostOnly(r.Host), challenge.Identifier.Value) && // mitigate DNS rebinding attacks
 		r.Method == "GET" {
 		w.Header().Add("Content-Type", "text/plain")
-		w.Write([]byte(chalInfo.KeyAuth))
+		w.Write([]byte(challenge.KeyAuthorization))
 		r.Close = true
-		log.Printf("[INFO][%s] Served key authentication (HTTP challenge)", chalInfo.Domain)
+		logger.Info("served key authentication",
+			zap.String("identifier", challenge.Identifier.Value),
+			zap.String("challenge", "http-01"),
+			zap.String("remote", r.RemoteAddr),
+			zap.Bool("distributed", distributed))
 		return true
 	}
 	return false
+}
+
+// SolveHTTPChallenge solves the HTTP challenge. It should be used only on HTTP requests that are
+// from ACME servers trying to validate an identifier (i.e. LooksLikeHTTPChallenge() == true). It
+// returns true if the request criteria check out and it answered with key authentication, in which
+// case no further handling of the request is necessary.
+func SolveHTTPChallenge(logger *zap.Logger, w http.ResponseWriter, r *http.Request, challenge acme.Challenge) bool {
+	return solveHTTPChallenge(logger, w, r, challenge, false)
 }
 
 // LooksLikeHTTPChallenge returns true if r looks like an ACME

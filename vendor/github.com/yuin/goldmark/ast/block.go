@@ -7,19 +7,19 @@ import (
 	textm "github.com/yuin/goldmark/text"
 )
 
-// A BaseBlock struct implements the Node interface.
+// A BaseBlock struct implements the Node interface partialliy.
 type BaseBlock struct {
 	BaseNode
 	blankPreviousLines bool
 	lines              *textm.Segments
 }
 
-// Type implements Node.Type
+// Type implements Node.Type.
 func (b *BaseBlock) Type() NodeType {
 	return TypeBlock
 }
 
-// IsRaw implements Node.IsRaw
+// IsRaw implements Node.IsRaw.
 func (b *BaseBlock) IsRaw() bool {
 	return false
 }
@@ -34,7 +34,7 @@ func (b *BaseBlock) SetBlankPreviousLines(v bool) {
 	b.blankPreviousLines = v
 }
 
-// Lines implements Node.Lines
+// Lines implements Node.Lines.
 func (b *BaseBlock) Lines() *textm.Segments {
 	if b.lines == nil {
 		b.lines = textm.NewSegments()
@@ -42,7 +42,7 @@ func (b *BaseBlock) Lines() *textm.Segments {
 	return b.lines
 }
 
-// SetLines implements Node.SetLines
+// SetLines implements Node.SetLines.
 func (b *BaseBlock) SetLines(v *textm.Segments) {
 	b.lines = v
 }
@@ -50,6 +50,8 @@ func (b *BaseBlock) SetLines(v *textm.Segments) {
 // A Document struct is a root node of Markdown text.
 type Document struct {
 	BaseBlock
+
+	meta map[string]interface{}
 }
 
 // KindDocument is a NodeKind of the Document node.
@@ -70,10 +72,42 @@ func (n *Document) Kind() NodeKind {
 	return KindDocument
 }
 
+// OwnerDocument implements Node.OwnerDocument.
+func (n *Document) OwnerDocument() *Document {
+	return n
+}
+
+// Meta returns metadata of this document.
+func (n *Document) Meta() map[string]interface{} {
+	if n.meta == nil {
+		n.meta = map[string]interface{}{}
+	}
+	return n.meta
+}
+
+// SetMeta sets given metadata to this document.
+func (n *Document) SetMeta(meta map[string]interface{}) {
+	if n.meta == nil {
+		n.meta = map[string]interface{}{}
+	}
+	for k, v := range meta {
+		n.meta[k] = v
+	}
+}
+
+// AddMeta adds given metadata to this document.
+func (n *Document) AddMeta(key string, value interface{}) {
+	if n.meta == nil {
+		n.meta = map[string]interface{}{}
+	}
+	n.meta[key] = value
+}
+
 // NewDocument returns a new Document node.
 func NewDocument() *Document {
 	return &Document{
 		BaseBlock: BaseBlock{},
+		meta:      nil,
 	}
 }
 
@@ -311,7 +345,7 @@ type List struct {
 	Marker byte
 
 	// IsTight is a true if this list is a 'tight' list.
-	// See https://spec.commonmark.org/0.29/#loose for details.
+	// See https://spec.commonmark.org/0.30/#loose for details.
 	IsTight bool
 
 	// Start is an initial number of this ordered list.
@@ -393,23 +427,23 @@ func NewListItem(offset int) *ListItem {
 }
 
 // HTMLBlockType represents kinds of an html blocks.
-// See https://spec.commonmark.org/0.29/#html-blocks
+// See https://spec.commonmark.org/0.30/#html-blocks
 type HTMLBlockType int
 
 const (
-	// HTMLBlockType1 represents type 1 html blocks
+	// HTMLBlockType1 represents type 1 html blocks.
 	HTMLBlockType1 HTMLBlockType = iota + 1
-	// HTMLBlockType2 represents type 2 html blocks
+	// HTMLBlockType2 represents type 2 html blocks.
 	HTMLBlockType2
-	// HTMLBlockType3 represents type 3 html blocks
+	// HTMLBlockType3 represents type 3 html blocks.
 	HTMLBlockType3
-	// HTMLBlockType4 represents type 4 html blocks
+	// HTMLBlockType4 represents type 4 html blocks.
 	HTMLBlockType4
-	// HTMLBlockType5 represents type 5 html blocks
+	// HTMLBlockType5 represents type 5 html blocks.
 	HTMLBlockType5
-	// HTMLBlockType6 represents type 6 html blocks
+	// HTMLBlockType6 represents type 6 html blocks.
 	HTMLBlockType6
-	// HTMLBlockType7 represents type 7 html blocks
+	// HTMLBlockType7 represents type 7 html blocks.
 	HTMLBlockType7
 )
 

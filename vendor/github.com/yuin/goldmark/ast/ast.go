@@ -39,16 +39,11 @@ func NewNodeKind(name string) NodeKind {
 	return kindMax
 }
 
-// An Attribute is an attribute of the Node
+// An Attribute is an attribute of the Node.
 type Attribute struct {
 	Name  []byte
 	Value interface{}
 }
-
-var attrNameIDS = []byte("#")
-var attrNameID = []byte("id")
-var attrNameClassS = []byte(".")
-var attrNameClass = []byte("class")
 
 // A Node interface defines basic AST node functionalities.
 type Node interface {
@@ -116,6 +111,11 @@ type Node interface {
 	// tail of the children.
 	InsertAfter(self, v1, insertee Node)
 
+	// OwnerDocument returns this node's owner document.
+	// If this node is not a child of the Document node, OwnerDocument
+	// returns nil.
+	OwnerDocument() *Document
+
 	// Dump dumps an AST tree structure to stdout.
 	// This function completely aimed for debugging.
 	// level is a indent level. Implementer should indent informations with
@@ -169,7 +169,7 @@ type Node interface {
 	RemoveAttributes()
 }
 
-// A BaseNode struct implements the Node interface.
+// A BaseNode struct implements the Node interface partialliy.
 type BaseNode struct {
 	firstChild Node
 	lastChild  Node
@@ -248,7 +248,7 @@ func (n *BaseNode) RemoveChildren(self Node) {
 	n.childCount = 0
 }
 
-// SortChildren implements Node.SortChildren
+// SortChildren implements Node.SortChildren.
 func (n *BaseNode) SortChildren(comparator func(n1, n2 Node) int) {
 	var sorted Node
 	current := n.firstChild
@@ -358,6 +358,22 @@ func (n *BaseNode) InsertBefore(self, v1, insertee Node) {
 	}
 }
 
+// OwnerDocument implements Node.OwnerDocument.
+func (n *BaseNode) OwnerDocument() *Document {
+	d := n.Parent()
+	for {
+		p := d.Parent()
+		if p == nil {
+			if v, ok := d.(*Document); ok {
+				return v
+			}
+			break
+		}
+		d = p
+	}
+	return nil
+}
+
 // Text implements Node.Text  .
 func (n *BaseNode) Text(source []byte) []byte {
 	var buf bytes.Buffer
@@ -383,7 +399,7 @@ func (n *BaseNode) SetAttribute(name []byte, value interface{}) {
 	n.attributes = append(n.attributes, Attribute{name, value})
 }
 
-// SetAttributeString implements Node.SetAttributeString
+// SetAttributeString implements Node.SetAttributeString.
 func (n *BaseNode) SetAttributeString(name string, value interface{}) {
 	n.SetAttribute(util.StringToReadOnlyBytes(name), value)
 }
@@ -406,12 +422,12 @@ func (n *BaseNode) AttributeString(s string) (interface{}, bool) {
 	return n.Attribute(util.StringToReadOnlyBytes(s))
 }
 
-// Attributes implements Node.Attributes
+// Attributes implements Node.Attributes.
 func (n *BaseNode) Attributes() []Attribute {
 	return n.attributes
 }
 
-// RemoveAttributes implements Node.RemoveAttributes
+// RemoveAttributes implements Node.RemoveAttributes.
 func (n *BaseNode) RemoveAttributes() {
 	n.attributes = nil
 }

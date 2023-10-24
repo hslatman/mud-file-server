@@ -15,15 +15,16 @@
 package certmagic
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"io/ioutil"
-	"log"
 	"net"
+	"os"
 	"strings"
 	"time"
 
+	"go.uber.org/zap"
 	"golang.org/x/crypto/ocsp"
 )
 
@@ -42,19 +43,46 @@ type Certificate struct {
 	Tags []string
 
 	// OCSP contains the certificate's parsed OCSP response.
+	// It is not necessarily the response that is stapled
+	// (e.g. if the status is not Good), it is simply the
+	// most recent OCSP response we have for this certificate.
 	ocsp *ocsp.Response
 
-	// The hex-encoded hash of this cert's chain's bytes.
+	// The hex-encoded hash of this cert's chain's DER bytes.
 	hash string
 
-	// Whether this certificate is under our management
+	// Whether this certificate is under our management.
 	managed bool
+
+	// The unique string identifying the issuer of this certificate.
+	issuerKey string
 }
+
+// Empty returns true if the certificate struct is not filled out; at
+// least the tls.Certificate.Certificate field is expected to be set.
+func (cert Certificate) Empty() bool {
+	return len(cert.Certificate.Certificate) == 0
+}
+
+// Hash returns a checksum of the certificate chain's DER-encoded bytes.
+func (cert Certificate) Hash() string { return cert.hash }
 
 // NeedsRenewal returns true if the certificate is
 // expiring soon (according to cfg) or has expired.
 func (cert Certificate) NeedsRenewal(cfg *Config) bool {
-	return currentlyInRenewalWindow(cert.Leaf.NotBefore, cert.Leaf.NotAfter, cfg.RenewalWindowRatio)
+	return currentlyInRenewalWindow(cert.Leaf.NotBefore, expiresAt(cert.Leaf), cfg.RenewalWindowRatio)
+}
+
+// Expired returns true if the certificate has expired.
+func (cert Certificate) Expired() bool {
+	if cert.Leaf == nil {
+		// ideally cert.Leaf would never be nil, but this can happen for
+		// "synthetic" certs like those made to solve the TLS-ALPN challenge
+		// which adds a special cert directly  to the cache, since
+		// tls.X509KeyPair() discards the leaf; oh well
+		return false
+	}
+	return time.Now().After(expiresAt(cert.Leaf))
 }
 
 // currentlyInRenewalWindow returns true if the current time is
@@ -84,6 +112,16 @@ func (cert Certificate) HasTag(tag string) bool {
 	return false
 }
 
+// expiresAt return the time that a certificate expires. Account for the 1s
+// resolution of ASN.1 UTCTime/GeneralizedTime by including the extra fraction
+// of a second of certificate validity beyond the NotAfter value.
+func expiresAt(cert *x509.Certificate) time.Time {
+	if cert == nil {
+		return time.Time{}
+	}
+	return cert.NotAfter.Truncate(time.Second).Add(1 * time.Second)
+}
+
 // CacheManagedCertificate loads the certificate for domain into the
 // cache, from the TLS storage for managed certificates. It returns a
 // copy of the Certificate that was put into the cache.
@@ -91,108 +129,114 @@ func (cert Certificate) HasTag(tag string) bool {
 // This is a lower-level method; normally you'll call Manage() instead.
 //
 // This method is safe for concurrent use.
-func (cfg *Config) CacheManagedCertificate(domain string) (Certificate, error) {
-	cert, err := cfg.loadManagedCertificate(domain)
+func (cfg *Config) CacheManagedCertificate(ctx context.Context, domain string) (Certificate, error) {
+	cert, err := cfg.loadManagedCertificate(ctx, domain)
 	if err != nil {
 		return cert, err
 	}
 	cfg.certCache.cacheCertificate(cert)
-	cfg.emit("cached_managed_cert", cert.Names)
+	cfg.emit(ctx, "cached_managed_cert", map[string]any{"sans": cert.Names})
 	return cert, nil
 }
 
-// loadManagedCertificate loads the managed certificate for domain,
-// but it does not add it to the cache. It just loads from storage.
-func (cfg *Config) loadManagedCertificate(domain string) (Certificate, error) {
-	certRes, err := cfg.loadCertResource(domain)
+// loadManagedCertificate loads the managed certificate for domain from any
+// of the configured issuers' storage locations, but it does not add it to
+// the cache. It just loads from storage and returns it.
+func (cfg *Config) loadManagedCertificate(ctx context.Context, domain string) (Certificate, error) {
+	certRes, err := cfg.loadCertResourceAnyIssuer(ctx, domain)
 	if err != nil {
 		return Certificate{}, err
 	}
-	cert, err := makeCertificateWithOCSP(cfg.Storage, certRes.CertificatePEM, certRes.PrivateKeyPEM)
+	cert, err := cfg.makeCertificateWithOCSP(ctx, certRes.CertificatePEM, certRes.PrivateKeyPEM)
 	if err != nil {
 		return cert, err
 	}
 	cert.managed = true
+	cert.issuerKey = certRes.issuerKey
 	return cert, nil
 }
 
 // CacheUnmanagedCertificatePEMFile loads a certificate for host using certFile
 // and keyFile, which must be in PEM format. It stores the certificate in
-// the in-memory cache.
+// the in-memory cache and returns the hash, useful for removing from the cache.
 //
 // This method is safe for concurrent use.
-func (cfg *Config) CacheUnmanagedCertificatePEMFile(certFile, keyFile string, tags []string) error {
-	cert, err := makeCertificateFromDiskWithOCSP(cfg.Storage, certFile, keyFile)
+func (cfg *Config) CacheUnmanagedCertificatePEMFile(ctx context.Context, certFile, keyFile string, tags []string) (string, error) {
+	cert, err := cfg.makeCertificateFromDiskWithOCSP(ctx, cfg.Storage, certFile, keyFile)
 	if err != nil {
-		return err
+		return "", err
 	}
 	cert.Tags = tags
 	cfg.certCache.cacheCertificate(cert)
-	cfg.emit("cached_unmanaged_cert", cert.Names)
-	return nil
+	cfg.emit(ctx, "cached_unmanaged_cert", map[string]any{"sans": cert.Names})
+	return cert.hash, nil
 }
 
-// CacheUnmanagedTLSCertificate adds tlsCert to the certificate cache.
+// CacheUnmanagedTLSCertificate adds tlsCert to the certificate cache
+//
+//	and returns the hash, useful for removing from the cache.
+//
 // It staples OCSP if possible.
 //
 // This method is safe for concurrent use.
-func (cfg *Config) CacheUnmanagedTLSCertificate(tlsCert tls.Certificate, tags []string) error {
+func (cfg *Config) CacheUnmanagedTLSCertificate(ctx context.Context, tlsCert tls.Certificate, tags []string) (string, error) {
 	var cert Certificate
 	err := fillCertFromLeaf(&cert, tlsCert)
 	if err != nil {
-		return err
+		return "", err
 	}
-	_, err = stapleOCSP(cfg.Storage, &cert, nil)
+	err = stapleOCSP(ctx, cfg.OCSP, cfg.Storage, &cert, nil)
 	if err != nil {
-		log.Printf("[WARNING] Stapling OCSP: %v", err)
+		cfg.Logger.Warn("stapling OCSP", zap.Error(err))
 	}
-	cfg.emit("cached_unmanaged_cert", cert.Names)
+	cfg.emit(ctx, "cached_unmanaged_cert", map[string]any{"sans": cert.Names})
 	cert.Tags = tags
 	cfg.certCache.cacheCertificate(cert)
-	return nil
+	return cert.hash, nil
 }
 
 // CacheUnmanagedCertificatePEMBytes makes a certificate out of the PEM bytes
-// of the certificate and key, then caches it in memory.
+// of the certificate and key, then caches it in memory,  and returns the hash,
+// which is useful for removing from the cache.
 //
 // This method is safe for concurrent use.
-func (cfg *Config) CacheUnmanagedCertificatePEMBytes(certBytes, keyBytes []byte, tags []string) error {
-	cert, err := makeCertificateWithOCSP(cfg.Storage, certBytes, keyBytes)
+func (cfg *Config) CacheUnmanagedCertificatePEMBytes(ctx context.Context, certBytes, keyBytes []byte, tags []string) (string, error) {
+	cert, err := cfg.makeCertificateWithOCSP(ctx, certBytes, keyBytes)
 	if err != nil {
-		return err
+		return "", err
 	}
 	cert.Tags = tags
 	cfg.certCache.cacheCertificate(cert)
-	cfg.emit("cached_unmanaged_cert", cert.Names)
-	return nil
+	cfg.emit(ctx, "cached_unmanaged_cert", map[string]any{"sans": cert.Names})
+	return cert.hash, nil
 }
 
 // makeCertificateFromDiskWithOCSP makes a Certificate by loading the
 // certificate and key files. It fills out all the fields in
 // the certificate except for the Managed and OnDemand flags.
 // (It is up to the caller to set those.) It staples OCSP.
-func makeCertificateFromDiskWithOCSP(storage Storage, certFile, keyFile string) (Certificate, error) {
-	certPEMBlock, err := ioutil.ReadFile(certFile)
+func (cfg Config) makeCertificateFromDiskWithOCSP(ctx context.Context, storage Storage, certFile, keyFile string) (Certificate, error) {
+	certPEMBlock, err := os.ReadFile(certFile)
 	if err != nil {
 		return Certificate{}, err
 	}
-	keyPEMBlock, err := ioutil.ReadFile(keyFile)
+	keyPEMBlock, err := os.ReadFile(keyFile)
 	if err != nil {
 		return Certificate{}, err
 	}
-	return makeCertificateWithOCSP(storage, certPEMBlock, keyPEMBlock)
+	return cfg.makeCertificateWithOCSP(ctx, certPEMBlock, keyPEMBlock)
 }
 
 // makeCertificateWithOCSP is the same as makeCertificate except that it also
 // staples OCSP to the certificate.
-func makeCertificateWithOCSP(storage Storage, certPEMBlock, keyPEMBlock []byte) (Certificate, error) {
+func (cfg Config) makeCertificateWithOCSP(ctx context.Context, certPEMBlock, keyPEMBlock []byte) (Certificate, error) {
 	cert, err := makeCertificate(certPEMBlock, keyPEMBlock)
 	if err != nil {
 		return cert, err
 	}
-	_, err = stapleOCSP(storage, &cert, certPEMBlock)
+	err = stapleOCSP(ctx, cfg.OCSP, cfg.Storage, &cert, certPEMBlock)
 	if err != nil {
-		log.Printf("[WARNING] Stapling OCSP: %v", err)
+		cfg.Logger.Warn("stapling OCSP", zap.Error(err), zap.Strings("identifiers", cert.Names))
 	}
 	return cert, nil
 }
@@ -231,11 +275,15 @@ func fillCertFromLeaf(cert *Certificate, tlsCert tls.Certificate) error {
 	// the leaf cert should be the one for the site; we must set
 	// the tls.Certificate.Leaf field so that TLS handshakes are
 	// more efficient
-	leaf, err := x509.ParseCertificate(tlsCert.Certificate[0])
-	if err != nil {
-		return err
+	leaf := cert.Certificate.Leaf
+	if leaf == nil {
+		var err error
+		leaf, err = x509.ParseCertificate(tlsCert.Certificate[0])
+		if err != nil {
+			return err
+		}
+		cert.Certificate.Leaf = leaf
 	}
-	cert.Certificate.Leaf = leaf
 
 	// for convenience, we do want to assemble all the
 	// subjects on the certificate into one list
@@ -266,8 +314,6 @@ func fillCertFromLeaf(cert *Certificate, tlsCert tls.Certificate) error {
 		return fmt.Errorf("certificate has no names")
 	}
 
-	// save the hash of this certificate (chain) and
-	// expiration date, for necessity and efficiency
 	cert.hash = hashCertificateChain(cert.Certificate.Certificate)
 
 	return nil
@@ -282,42 +328,35 @@ func fillCertFromLeaf(cert *Certificate, tlsCert tls.Certificate) error {
 // means that another instance renewed the certificate in the
 // meantime, and it would be a good idea to simply load the cert
 // into our cache rather than repeating the renewal process again.
-func (cfg *Config) managedCertInStorageExpiresSoon(cert Certificate) (bool, error) {
-	certRes, err := cfg.loadCertResource(cert.Names[0])
+func (cfg *Config) managedCertInStorageExpiresSoon(ctx context.Context, cert Certificate) (bool, error) {
+	certRes, err := cfg.loadCertResourceAnyIssuer(ctx, cert.Names[0])
 	if err != nil {
 		return false, err
 	}
-	tlsCert, err := tls.X509KeyPair(certRes.CertificatePEM, certRes.PrivateKeyPEM)
-	if err != nil {
-		return false, err
-	}
-	leaf, err := x509.ParseCertificate(tlsCert.Certificate[0])
-	if err != nil {
-		return false, err
-	}
-	return currentlyInRenewalWindow(leaf.NotBefore, leaf.NotAfter, cfg.RenewalWindowRatio), nil
+	_, needsRenew := cfg.managedCertNeedsRenewal(certRes)
+	return needsRenew, nil
 }
 
 // reloadManagedCertificate reloads the certificate corresponding to the name(s)
 // on oldCert into the cache, from storage. This also replaces the old certificate
 // with the new one, so that all configurations that used the old cert now point
 // to the new cert. It assumes that the new certificate for oldCert.Names[0] is
-// already in storage.
-func (cfg *Config) reloadManagedCertificate(oldCert Certificate) error {
-	log.Printf("[INFO] Reloading managed certificate for %v", oldCert.Names)
-	newCert, err := cfg.loadManagedCertificate(oldCert.Names[0])
+// already in storage. It returns the newly-loaded certificate if successful.
+func (cfg *Config) reloadManagedCertificate(ctx context.Context, oldCert Certificate) (Certificate, error) {
+	cfg.Logger.Info("reloading managed certificate", zap.Strings("identifiers", oldCert.Names))
+	newCert, err := cfg.loadManagedCertificate(ctx, oldCert.Names[0])
 	if err != nil {
-		return fmt.Errorf("loading managed certificate for %v from storage: %v", oldCert.Names, err)
+		return Certificate{}, fmt.Errorf("loading managed certificate for %v from storage: %v", oldCert.Names, err)
 	}
 	cfg.certCache.replaceCertificate(oldCert, newCert)
-	return nil
+	return newCert, nil
 }
 
 // SubjectQualifiesForCert returns true if subj is a name which,
 // as a quick sanity check, looks like it could be the subject
 // of a certificate. Requirements are:
 // - must not be empty
-// - must not start or end with a dot (RFC 1034)
+// - must not start or end with a dot (RFC 1034; RFC 6066 section 3)
 // - must not contain common accidental special characters
 func SubjectQualifiesForCert(subj string) bool {
 	// must not be empty
@@ -327,8 +366,9 @@ func SubjectQualifiesForCert(subj string) bool {
 		!strings.HasPrefix(subj, ".") &&
 		!strings.HasSuffix(subj, ".") &&
 
-		// if it has a wildcard, must be a left-most label
-		(!strings.Contains(subj, "*") || strings.HasPrefix(subj, "*.")) &&
+		// if it has a wildcard, must be a left-most label (or exactly "*"
+		// which won't be trusted by browsers but still technically works)
+		(!strings.Contains(subj, "*") || strings.HasPrefix(subj, "*.") || subj == "*") &&
 
 		// must not contain other common special characters
 		!strings.ContainsAny(subj, "()[]{}<> \t\n\"\\!@#$%^&|;'+=")
@@ -342,33 +382,47 @@ func SubjectQualifiesForCert(subj string) bool {
 // allowed, as long as they conform to CABF requirements (only
 // one wildcard label, and it must be the left-most label).
 func SubjectQualifiesForPublicCert(subj string) bool {
-	// must at least qualify for certificate
+	// must at least qualify for a certificate
 	return SubjectQualifiesForCert(subj) &&
 
-		// localhost is ineligible
-		subj != "localhost" &&
-
-		// .localhost TLD is ineligible
-		!strings.HasSuffix(subj, ".localhost") &&
-
-		// .local TLD is ineligible
-		!strings.HasSuffix(subj, ".local") &&
-
-		// only one wildcard label allowed, and it must be left-most
-		(!strings.Contains(subj, "*") ||
-			(strings.Count(subj, "*") == 1 &&
-				len(subj) > 2 &&
-				strings.HasPrefix(subj, "*."))) &&
+		// localhost, .localhost TLD, and .local TLD are ineligible
+		!SubjectIsInternal(subj) &&
 
 		// cannot be an IP address (as of yet), see
 		// https://community.letsencrypt.org/t/certificate-for-static-ip/84/2?u=mholt
-		net.ParseIP(subj) == nil
+		!SubjectIsIP(subj) &&
+
+		// only one wildcard label allowed, and it must be left-most, with 3+ labels
+		(!strings.Contains(subj, "*") ||
+			(strings.Count(subj, "*") == 1 &&
+				strings.Count(subj, ".") > 1 &&
+				len(subj) > 2 &&
+				strings.HasPrefix(subj, "*.")))
+}
+
+// SubjectIsIP returns true if subj is an IP address.
+func SubjectIsIP(subj string) bool {
+	return net.ParseIP(subj) != nil
+}
+
+// SubjectIsInternal returns true if subj is an internal-facing
+// hostname or address.
+func SubjectIsInternal(subj string) bool {
+	return subj == "localhost" ||
+		strings.HasSuffix(subj, ".localhost") ||
+		strings.HasSuffix(subj, ".local")
 }
 
 // MatchWildcard returns true if subject (a candidate DNS name)
 // matches wildcard (a reference DNS name), mostly according to
-// RFC-compliant wildcard rules.
+// RFC 6125-compliant wildcard rules. See also RFC 2818 which
+// states that IP addresses must match exactly, but this function
+// does not attempt to distinguish IP addresses from internal or
+// external DNS names that happen to look like IP addresses.
+// It uses DNS wildcard matching logic and is case-insensitive.
+// https://tools.ietf.org/html/rfc2818#section-3.1
 func MatchWildcard(subject, wildcard string) bool {
+	subject, wildcard = strings.ToLower(subject), strings.ToLower(wildcard)
 	if subject == wildcard {
 		return true
 	}

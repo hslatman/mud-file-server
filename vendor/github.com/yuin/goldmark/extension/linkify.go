@@ -11,9 +11,9 @@ import (
 	"github.com/yuin/goldmark/util"
 )
 
-var wwwURLRegxp = regexp.MustCompile(`^www\.[-a-zA-Z0-9@:%._\+~#=]{2,256}\.[a-z]+(?:(?:/|[#?])[-a-zA-Z0-9@:%_\+.~#!?&//=\(\);,'">\^{}\[\]` + "`" + `]*)?`)
+var wwwURLRegxp = regexp.MustCompile(`^www\.[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-z]+(?:[/#?][-a-zA-Z0-9@:%_\+.~#!?&/=\(\);,'">\^{}\[\]` + "`" + `]*)?`) //nolint:golint,lll
 
-var urlRegexp = regexp.MustCompile(`^(?:http|https|ftp):\/\/(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{2,256}\.[a-z]+(?:(?:/|[#?])[-a-zA-Z0-9@:%_+.~#$!?&//=\(\);,'">\^{}\[\]` + "`" + `]*)?`)
+var urlRegexp = regexp.MustCompile(`^(?:http|https|ftp)://[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-z]+(?::\d+)?(?:[/#?][-a-zA-Z0-9@:%_+.~#$!?&/=\(\);,'">\^{}\[\]` + "`" + `]*)?`) //nolint:golint,lll
 
 // An LinkifyConfig struct is a data structure that holds configuration of the
 // Linkify extension.
@@ -24,10 +24,12 @@ type LinkifyConfig struct {
 	EmailRegexp      *regexp.Regexp
 }
 
-const optLinkifyAllowedProtocols parser.OptionName = "LinkifyAllowedProtocols"
-const optLinkifyURLRegexp parser.OptionName = "LinkifyURLRegexp"
-const optLinkifyWWWRegexp parser.OptionName = "LinkifyWWWRegexp"
-const optLinkifyEmailRegexp parser.OptionName = "LinkifyEmailRegexp"
+const (
+	optLinkifyAllowedProtocols parser.OptionName = "LinkifyAllowedProtocols"
+	optLinkifyURLRegexp        parser.OptionName = "LinkifyURLRegexp"
+	optLinkifyWWWRegexp        parser.OptionName = "LinkifyWWWRegexp"
+	optLinkifyEmailRegexp      parser.OptionName = "LinkifyEmailRegexp"
+)
 
 // SetOption implements SetOptioner.
 func (c *LinkifyConfig) SetOption(name parser.OptionName, value interface{}) {
@@ -90,9 +92,6 @@ func WithLinkifyURLRegexp(value *regexp.Regexp) LinkifyOption {
 	}
 }
 
-// WithLinkifyWWWRegexp is a functional option that specify
-// a pattern of the URL without a protocol.
-// This pattern must start with 'www.' .
 type withLinkifyWWWRegexp struct {
 	value *regexp.Regexp
 }
@@ -105,14 +104,15 @@ func (o *withLinkifyWWWRegexp) SetLinkifyOption(p *LinkifyConfig) {
 	p.WWWRegexp = o.value
 }
 
+// WithLinkifyWWWRegexp is a functional option that specify
+// a pattern of the URL without a protocol.
+// This pattern must start with 'www.' .
 func WithLinkifyWWWRegexp(value *regexp.Regexp) LinkifyOption {
 	return &withLinkifyWWWRegexp{
 		value: value,
 	}
 }
 
-// WithLinkifyWWWRegexp is a functional otpion that specify
-// a pattern of the email address.
 type withLinkifyEmailRegexp struct {
 	value *regexp.Regexp
 }
@@ -125,6 +125,8 @@ func (o *withLinkifyEmailRegexp) SetLinkifyOption(p *LinkifyConfig) {
 	p.EmailRegexp = o.value
 }
 
+// WithLinkifyEmailRegexp is a functional otpion that specify
+// a pattern of the email address.
 func WithLinkifyEmailRegexp(value *regexp.Regexp) LinkifyOption {
 	return &withLinkifyEmailRegexp{
 		value: value,
@@ -156,10 +158,12 @@ func (s *linkifyParser) Trigger() []byte {
 	return []byte{' ', '*', '_', '~', '('}
 }
 
-var protoHTTP = []byte("http:")
-var protoHTTPS = []byte("https:")
-var protoFTP = []byte("ftp:")
-var domainWWW = []byte("www.")
+var (
+	protoHTTP  = []byte("http:")
+	protoHTTPS = []byte("https:")
+	protoFTP   = []byte("ftp:")
+	domainWWW  = []byte("www.")
+)
 
 func (s *linkifyParser) Parse(parent ast.Node, block text.Reader, pc parser.Context) ast.Node {
 	if pc.IsInLinkLabel() {
@@ -269,9 +273,20 @@ func (s *linkifyParser) Parse(parent ast.Node, block text.Reader, pc parser.Cont
 		s := segment.WithStop(segment.Start + 1)
 		ast.MergeOrAppendTextSegment(parent, s)
 	}
-	consumes += m[1]
+	i := m[1] - 1
+	for ; i > 0; i-- {
+		c := line[i]
+		switch c {
+		case '?', '!', '.', ',', ':', '*', '_', '~':
+		default:
+			goto endfor
+		}
+	}
+endfor:
+	i++
+	consumes += i
 	block.Advance(consumes)
-	n := ast.NewTextSegment(text.NewSegment(start, start+m[1]))
+	n := ast.NewTextSegment(text.NewSegment(start, start+i))
 	link := ast.NewAutoLink(typ, n)
 	link.Protocol = protocol
 	return link
@@ -288,6 +303,8 @@ type linkify struct {
 // Linkify is an extension that allow you to parse text that seems like a URL.
 var Linkify = &linkify{}
 
+// NewLinkify creates a new [goldmark.Extender] that
+// allow you to parse text that seems like a URL.
 func NewLinkify(opts ...LinkifyOption) goldmark.Extender {
 	return &linkify{
 		options: opts,

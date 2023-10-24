@@ -24,13 +24,6 @@ import (
 	"github.com/openconfig/goyang/pkg/yang"
 )
 
-var (
-	// YangMaxNumber represents the maximum value for any integer type.
-	YangMaxNumber = yang.Number{Kind: yang.MaxNumber}
-	// YangMinNumber represents the minimum value for any integer type.
-	YangMinNumber = yang.Number{Kind: yang.MinNumber}
-)
-
 // CompressedSchemaAnnotation stores the name of the annotation indicating
 // whether a set of structs were built with -compress_path. It is appended
 // to the yang.Entry struct of the root entity of the structs within the
@@ -50,9 +43,29 @@ func Children(e *yang.Entry) []*yang.Entry {
 	return entries
 }
 
-// SchemaTreeRoot returns the root of the schema tree, given any node in that
-// tree. It returns nil if schema is nil.
-func SchemaTreeRoot(schema *yang.Entry) *yang.Entry {
+// TopLevelModule returns the module in which the root node of the schema tree
+// in which the input node was instantiated was declared. It returns nil if
+// schema is nil.
+//
+// In this example, container 'con' has TopLevelModule "openconfig-simple".
+//
+//	module openconfig-augment {
+//	  import openconfig-simple { prefix "s"; }
+//	  import openconfig-grouping { prefix "g"; }
+//
+//	  augment "/s:parent/child/state" {
+//	    uses g:group;
+//	  }
+//	}
+//
+//	module openconfig-grouping {
+//	  grouping group {
+//	    container con {
+//	      leaf zero { type string; }
+//	    }
+//	  }
+//	}
+func TopLevelModule(schema *yang.Entry) *yang.Entry {
 	if schema == nil {
 		return nil
 	}
@@ -195,6 +208,12 @@ func IsYgotAnnotation(s reflect.StructField) bool {
 	return ok
 }
 
+// IsYangPresence reports whether struct field s is a YANG presence container.
+func IsYangPresence(s reflect.StructField) bool {
+	_, ok := s.Tag.Lookup("yangPresence")
+	return ok
+}
+
 // IsSimpleEnumerationType returns true when the type supplied is a simple
 // enumeration (i.e., a leaf that is defined as type enumeration { ... },
 // and is not a typedef that contains an enumeration, or a union that
@@ -209,14 +228,12 @@ func IsSimpleEnumerationType(t *yang.YangType) bool {
 
 // IsIdentityrefLeaf returns true if the supplied yang.Entry represents an
 // identityref.
-// TODO(wenbli): add unit test
 func IsIdentityrefLeaf(e *yang.Entry) bool {
 	return e.Type.IdentityBase != nil
 }
 
 // IsYANGBaseType determines whether the supplied YangType is a built-in type
 // in YANG, or a derived type (i.e., typedef).
-// TODO(wenbli): add unit test
 func IsYANGBaseType(t *yang.YangType) bool {
 	_, ok := yang.TypeKindFromName[t.Name]
 	return ok
@@ -305,18 +322,7 @@ func fixYangRegexp(pattern string) string {
 // the state. If the element at the top of the tree does not have config set, then config
 // is true. See https://tools.ietf.org/html/rfc6020#section-7.19.1.
 func IsConfig(e *yang.Entry) bool {
-	for ; e.Parent != nil; e = e.Parent {
-		switch e.Config {
-		case yang.TSTrue:
-			return true
-		case yang.TSFalse:
-			return false
-		}
-	}
-
-	// Reached the last element in the tree without explicit configuration
-	// being set.
-	return e.Config != yang.TSFalse
+	return !e.ReadOnly()
 }
 
 // isPathChild takes an input slice of strings representing a path and determines
@@ -417,6 +423,44 @@ func findFirstNonChoiceOrCaseInternal(e *yang.Entry) map[string]*yang.Entry {
 	return m
 }
 
+// findFirstNonChoiceOrCaseEntry recursively traverses the schema tree and returns a
+// map with the set of the first nodes in every path that are neither case nor
+// choice nodes. The keys in the map are the identifiers of the non-choice or case
+// elements, since the identifiers of all these child nodes MUST be unique
+// within all cases in a choice. If there are duplicate elements, then an error
+// is returned.
+// https://datatracker.ietf.org/doc/html/rfc7950#section-7.9.2
+func findFirstNonChoiceOrCaseEntry(e *yang.Entry) (map[string]*yang.Entry, error) {
+	m := make(map[string]*yang.Entry)
+	for _, ch := range e.Dir {
+		m2, err := findFirstNonChoiceOrCaseEntryInternal(ch)
+		if err != nil {
+			return nil, nil
+		}
+		addToEntryMap(m, m2)
+	}
+	return m, nil
+}
+
+// findFirstNonChoiceOrCaseEntryInternal is an internal part of
+// findFirstNonChoiceOrCaseEntry.
+func findFirstNonChoiceOrCaseEntryInternal(e *yang.Entry) (map[string]*yang.Entry, error) {
+	m := make(map[string]*yang.Entry)
+	switch {
+	case !IsChoiceOrCase(e):
+		m[e.Name] = e
+	case e.IsDir():
+		for _, ch := range e.Dir {
+			m2, err := findFirstNonChoiceOrCaseEntryInternal(ch)
+			if err != nil {
+				return nil, nil
+			}
+			addToEntryMap(m, m2)
+		}
+	}
+	return m, nil
+}
+
 // addToEntryMap merges from into to, overwriting overlapping key-value pairs.
 func addToEntryMap(to, from map[string]*yang.Entry) map[string]*yang.Entry {
 	for k, v := range from {
@@ -469,10 +513,13 @@ func EnumeratedUnionTypes(types []*yang.YangType) []*yang.YangType {
 // used under a leaf:
 // - a typedef within any kind or level of unions.
 //   - defining type is the typedef itself -- the closest place of definition.
+//
 // - a non-typedef within a non-typedef union.
 //   - defining type is the union (i.e. type of the leaf, which defines it)
+//
 // - a non-typedef within a non-typedef union within a non-typedef union.
 //   - defining type is the outer union (i.e. type of the leaf, which defines it).
+//
 // - a non-typedef within a typedef union within a non-typedef union.
 //   - defining type is the (inner) typedef union.
 func DefiningType(subtype *yang.YangType, leafType *yang.YangType) (*yang.YangType, error) {

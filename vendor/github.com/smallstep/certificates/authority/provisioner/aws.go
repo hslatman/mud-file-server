@@ -9,15 +9,24 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/pkg/errors"
+
+	"go.step.sm/crypto/jose"
+	"go.step.sm/crypto/sshutil"
+	"go.step.sm/crypto/x509util"
+	"go.step.sm/linkedca"
+
 	"github.com/smallstep/certificates/errs"
-	"github.com/smallstep/cli/jose"
+	"github.com/smallstep/certificates/webhook"
+
+	_ "embed"
 )
 
 // awsIssuer is the string used as issuer in the generated tokens.
@@ -29,27 +38,24 @@ const awsIdentityURL = "http://169.254.169.254/latest/dynamic/instance-identity/
 // awsSignatureURL is the url used to retrieve the instance identity signature.
 const awsSignatureURL = "http://169.254.169.254/latest/dynamic/instance-identity/signature"
 
+// awsAPITokenURL is the url used to get the IMDSv2 API token
+const awsAPITokenURL = "http://169.254.169.254/latest/api/token" //nolint:gosec // no credentials here
+
+// awsAPITokenTTL is the default TTL to use when requesting IMDSv2 API tokens
+// -- we keep this short-lived since we get a new token with every call to readURL()
+const awsAPITokenTTL = "30"
+
+// awsMetadataTokenHeader is the header that must be passed with every IMDSv2 request
+const awsMetadataTokenHeader = "X-aws-ec2-metadata-token" //nolint:gosec // no credentials here
+
+// awsMetadataTokenTTLHeader is the header used to indicate the token TTL requested
+const awsMetadataTokenTTLHeader = "X-aws-ec2-metadata-token-ttl-seconds" //nolint:gosec // no credentials here
+
 // awsCertificate is the certificate used to validate the instance identity
-// signature.
-const awsCertificate = `-----BEGIN CERTIFICATE-----
-MIIDIjCCAougAwIBAgIJAKnL4UEDMN/FMA0GCSqGSIb3DQEBBQUAMGoxCzAJBgNV
-BAYTAlVTMRMwEQYDVQQIEwpXYXNoaW5ndG9uMRAwDgYDVQQHEwdTZWF0dGxlMRgw
-FgYDVQQKEw9BbWF6b24uY29tIEluYy4xGjAYBgNVBAMTEWVjMi5hbWF6b25hd3Mu
-Y29tMB4XDTE0MDYwNTE0MjgwMloXDTI0MDYwNTE0MjgwMlowajELMAkGA1UEBhMC
-VVMxEzARBgNVBAgTCldhc2hpbmd0b24xEDAOBgNVBAcTB1NlYXR0bGUxGDAWBgNV
-BAoTD0FtYXpvbi5jb20gSW5jLjEaMBgGA1UEAxMRZWMyLmFtYXpvbmF3cy5jb20w
-gZ8wDQYJKoZIhvcNAQEBBQADgY0AMIGJAoGBAIe9GN//SRK2knbjySG0ho3yqQM3
-e2TDhWO8D2e8+XZqck754gFSo99AbT2RmXClambI7xsYHZFapbELC4H91ycihvrD
-jbST1ZjkLQgga0NE1q43eS68ZeTDccScXQSNivSlzJZS8HJZjgqzBlXjZftjtdJL
-XeE4hwvo0sD4f3j9AgMBAAGjgc8wgcwwHQYDVR0OBBYEFCXWzAgVyrbwnFncFFIs
-77VBdlE4MIGcBgNVHSMEgZQwgZGAFCXWzAgVyrbwnFncFFIs77VBdlE4oW6kbDBq
-MQswCQYDVQQGEwJVUzETMBEGA1UECBMKV2FzaGluZ3RvbjEQMA4GA1UEBxMHU2Vh
-dHRsZTEYMBYGA1UEChMPQW1hem9uLmNvbSBJbmMuMRowGAYDVQQDExFlYzIuYW1h
-em9uYXdzLmNvbYIJAKnL4UEDMN/FMAwGA1UdEwQFMAMBAf8wDQYJKoZIhvcNAQEF
-BQADgYEAFYcz1OgEhQBXIwIdsgCOS8vEtiJYF+j9uO6jz7VOmJqO+pRlAbRlvY8T
-C1haGgSI/A1uZUKs/Zfnph0oEI0/hu1IIJ/SKBDtN5lvmZ/IzbOPIJWirlsllQIQ
-7zvWbGd9c9+Rm3p04oTvhup99la7kZqevJK0QRdD/6NpCKsqP/0=
------END CERTIFICATE-----`
+// signature. It is embedded in the binary at compile time.
+//
+//go:embed aws_certificates.pem
+var awsCertificate string
 
 // awsSignatureAlgorithm is the signature algorithm used to verify the identity
 // document signature.
@@ -58,23 +64,51 @@ const awsSignatureAlgorithm = x509.SHA256WithRSA
 type awsConfig struct {
 	identityURL        string
 	signatureURL       string
-	certificate        *x509.Certificate
+	tokenURL           string
+	tokenTTL           string
+	certificates       []*x509.Certificate
 	signatureAlgorithm x509.SignatureAlgorithm
 }
 
-func newAWSConfig() (*awsConfig, error) {
-	block, _ := pem.Decode([]byte(awsCertificate))
-	if block == nil || block.Type != "CERTIFICATE" {
-		return nil, errors.New("error decoding AWS certificate")
+func newAWSConfig(certPath string) (*awsConfig, error) {
+	var certBytes []byte
+	if certPath == "" {
+		certBytes = []byte(awsCertificate)
+	} else {
+		if b, err := os.ReadFile(certPath); err == nil {
+			certBytes = b
+		} else {
+			return nil, errors.Wrapf(err, "error reading %s", certPath)
+		}
 	}
-	cert, err := x509.ParseCertificate(block.Bytes)
-	if err != nil {
-		return nil, errors.Wrap(err, "error parsing AWS certificate")
+
+	// Read all the certificates.
+	var certs []*x509.Certificate
+	for len(certBytes) > 0 {
+		var block *pem.Block
+		block, certBytes = pem.Decode(certBytes)
+		if block == nil {
+			break
+		}
+		if block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
+			continue
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			return nil, errors.Wrap(err, "error parsing AWS IID certificate")
+		}
+		certs = append(certs, cert)
 	}
+	if len(certs) == 0 {
+		return nil, errors.New("error parsing AWS IID certificate: no certificates found")
+	}
+
 	return &awsConfig{
 		identityURL:        awsIdentityURL,
 		signatureURL:       awsSignatureURL,
-		certificate:        cert,
+		tokenURL:           awsAPITokenURL,
+		tokenTTL:           awsAPITokenTTL,
+		certificates:       certs,
 		signatureAlgorithm: awsSignatureAlgorithm,
 	}, nil
 }
@@ -121,24 +155,39 @@ type awsInstanceIdentityDocument struct {
 // If InstanceAge is set, only the instances with a pendingTime within the given
 // period will be accepted.
 //
+// IIDRoots can be used to specify a path to the certificates used to verify the
+// identity certificate signature.
+//
 // Amazon Identity docs are available at
 // https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-identity-documents.html
 type AWS struct {
 	*base
+	ID                     string   `json:"-"`
 	Type                   string   `json:"type"`
 	Name                   string   `json:"name"`
 	Accounts               []string `json:"accounts"`
 	DisableCustomSANs      bool     `json:"disableCustomSANs"`
 	DisableTrustOnFirstUse bool     `json:"disableTrustOnFirstUse"`
+	IMDSVersions           []string `json:"imdsVersions"`
 	InstanceAge            Duration `json:"instanceAge,omitempty"`
+	IIDRoots               string   `json:"iidRoots,omitempty"`
 	Claims                 *Claims  `json:"claims,omitempty"`
-	claimer                *Claimer
+	Options                *Options `json:"options,omitempty"`
 	config                 *awsConfig
-	audiences              Audiences
+	ctl                    *Controller
 }
 
 // GetID returns the provisioner unique identifier.
 func (p *AWS) GetID() string {
+	if p.ID != "" {
+		return p.ID
+	}
+	return p.GetIDForToken()
+}
+
+// GetIDForToken returns an identifier that will be used to load the provisioner
+// from a token.
+func (p *AWS) GetIDForToken() string {
 	return "aws/" + p.Name
 }
 
@@ -154,7 +203,11 @@ func (p *AWS) GetTokenID(token string) (string, error) {
 		sum := sha256.Sum256([]byte(token))
 		return strings.ToLower(hex.EncodeToString(sum[:])), nil
 	}
-	return payload.ID, nil
+
+	// Use provisioner + instance-id as the identifier.
+	unique := fmt.Sprintf("%s.%s", p.GetIDForToken(), payload.document.InstanceID)
+	sum := sha256.Sum256([]byte(unique))
+	return strings.ToLower(hex.EncodeToString(sum[:])), nil
 }
 
 // GetName returns the name of the provisioner.
@@ -168,7 +221,7 @@ func (p *AWS) GetType() Type {
 }
 
 // GetEncryptedKey is not available in an AWS provisioner.
-func (p *AWS) GetEncryptedKey() (kid string, key string, ok bool) {
+func (p *AWS) GetEncryptedKey() (kid, key string, ok bool) {
 	return "", "", false
 }
 
@@ -183,14 +236,14 @@ func (p *AWS) GetIdentityToken(subject, caURL string) (string, error) {
 	var idoc awsInstanceIdentityDocument
 	doc, err := p.readURL(p.config.identityURL)
 	if err != nil {
-		return "", errors.Wrap(err, "error retrieving identity document, are you in an AWS VM?")
+		return "", errors.Wrap(err, "error retrieving identity document:\n  Are you in an AWS VM?\n  Is the metadata service enabled?\n  Are you using the proper metadata service version?")
 	}
 	if err := json.Unmarshal(doc, &idoc); err != nil {
 		return "", errors.Wrap(err, "error unmarshaling identity document")
 	}
 	sig, err := p.readURL(p.config.signatureURL)
 	if err != nil {
-		return "", errors.Wrap(err, "error retrieving identity document signature, are you in an AWS VM?")
+		return "", errors.Wrap(err, "error retrieving identity document:\n  Are you in an AWS VM?\n  Is the metadata service enabled?\n  Are you using the proper metadata service version?")
 	}
 	signature, err := base64.StdEncoding.DecodeString(string(sig))
 	if err != nil {
@@ -200,7 +253,7 @@ func (p *AWS) GetIdentityToken(subject, caURL string) (string, error) {
 		return "", err
 	}
 
-	audience, err := generateSignAudience(caURL, p.GetID())
+	audience, err := generateSignAudience(caURL, p.GetIDForToken())
 	if err != nil {
 		return "", err
 	}
@@ -208,7 +261,7 @@ func (p *AWS) GetIdentityToken(subject, caURL string) (string, error) {
 	// Create unique ID for Trust On First Use (TOFU). Only the first instance
 	// per provisioner is allowed as we don't have a way to trust the given
 	// sans.
-	unique := fmt.Sprintf("%s.%s", p.GetID(), idoc.InstanceID)
+	unique := fmt.Sprintf("%s.%s", p.GetIDForToken(), idoc.InstanceID)
 	sum := sha256.Sum256([]byte(unique))
 
 	// Create a JWT from the identity document
@@ -239,7 +292,7 @@ func (p *AWS) GetIdentityToken(subject, caURL string) (string, error) {
 
 	tok, err := jose.Signed(signer).Claims(payload).CompactSerialize()
 	if err != nil {
-		return "", errors.Wrap(err, "error serialiazing token")
+		return "", errors.Wrap(err, "error serializing token")
 	}
 
 	return tok, nil
@@ -255,48 +308,89 @@ func (p *AWS) Init(config Config) (err error) {
 	case p.InstanceAge.Value() < 0:
 		return errors.New("provisioner instanceAge cannot be negative")
 	}
-	// Update claims with global ones
-	if p.claimer, err = NewClaimer(p.Claims, config.Claims); err != nil {
-		return err
-	}
+
 	// Add default config
-	if p.config, err = newAWSConfig(); err != nil {
+	if p.config, err = newAWSConfig(p.IIDRoots); err != nil {
 		return err
 	}
-	p.audiences = config.Audiences.WithFragment(p.GetID())
-	return nil
+
+	// validate IMDS versions
+	if len(p.IMDSVersions) == 0 {
+		p.IMDSVersions = []string{"v2", "v1"}
+	}
+	for _, v := range p.IMDSVersions {
+		switch v {
+		case "v1":
+			// valid
+		case "v2":
+			// valid
+		default:
+			return errors.Errorf("%s: not a supported AWS Instance Metadata Service version", v)
+		}
+	}
+
+	config.Audiences = config.Audiences.WithFragment(p.GetIDForToken())
+	p.ctl, err = NewController(p, p.Claims, config, p.Options)
+	return
 }
 
 // AuthorizeSign validates the given token and returns the sign options that
 // will be used on certificate creation.
-func (p *AWS) AuthorizeSign(ctx context.Context, token string) ([]SignOption, error) {
+func (p *AWS) AuthorizeSign(_ context.Context, token string) ([]SignOption, error) {
 	payload, err := p.authorizeToken(token)
 	if err != nil {
 		return nil, errs.Wrap(http.StatusInternalServerError, err, "aws.AuthorizeSign")
 	}
 
 	doc := payload.document
+
+	// Template options
+	data := x509util.NewTemplateData()
+	data.SetCommonName(payload.Claims.Subject)
+	if v, err := unsafeParseSigned(token); err == nil {
+		data.SetToken(v)
+	}
+
 	// Enforce known CN and default DNS and IP if configured.
 	// By default we'll accept the CN and SANs in the CSR.
 	// There's no way to trust them other than TOFU.
 	var so []SignOption
 	if p.DisableCustomSANs {
-		so = append(so, dnsNamesValidator([]string{
-			fmt.Sprintf("ip-%s.%s.compute.internal", strings.Replace(doc.PrivateIP, ".", "-", -1), doc.Region),
-		}))
-		so = append(so, ipAddressesValidator([]net.IP{
-			net.ParseIP(doc.PrivateIP),
-		}))
+		dnsName := fmt.Sprintf("ip-%s.%s.compute.internal", strings.ReplaceAll(doc.PrivateIP, ".", "-"), doc.Region)
+		so = append(so,
+			dnsNamesValidator([]string{dnsName}),
+			ipAddressesValidator([]net.IP{
+				net.ParseIP(doc.PrivateIP),
+			}),
+			emailAddressesValidator(nil),
+			urisValidator(nil),
+		)
+
+		// Template options
+		data.SetSANs([]string{dnsName, doc.PrivateIP})
+	}
+
+	templateOptions, err := CustomTemplateOptions(p.Options, data, x509util.DefaultIIDLeafTemplate)
+	if err != nil {
+		return nil, errs.Wrap(http.StatusInternalServerError, err, "aws.AuthorizeSign")
 	}
 
 	return append(so,
+		p,
+		templateOptions,
 		// modifiers / withOptions
-		newProvisionerExtensionOption(TypeAWS, p.Name, doc.AccountID, "InstanceID", doc.InstanceID),
-		profileDefaultDuration(p.claimer.DefaultTLSCertDuration()),
+		newProvisionerExtensionOption(TypeAWS, p.Name, doc.AccountID, "InstanceID", doc.InstanceID).WithControllerOptions(p.ctl),
+		profileDefaultDuration(p.ctl.Claimer.DefaultTLSCertDuration()),
 		// validators
 		defaultPublicKeyValidator{},
 		commonNameValidator(payload.Claims.Subject),
-		newValidityValidator(p.claimer.MinTLSCertDuration(), p.claimer.MaxTLSCertDuration()),
+		newValidityValidator(p.ctl.Claimer.MinTLSCertDuration(), p.ctl.Claimer.MaxTLSCertDuration()),
+		newX509NamePolicyValidator(p.ctl.getPolicy().getX509()),
+		p.ctl.newWebhookController(
+			data,
+			linkedca.Webhook_X509,
+			webhook.WithAuthorizationPrincipal(doc.InstanceID),
+		),
 	), nil
 }
 
@@ -305,10 +399,7 @@ func (p *AWS) AuthorizeSign(ctx context.Context, token string) ([]SignOption, er
 // revocation status. Just confirms that the provisioner that created the
 // certificate was configured to allow renewals.
 func (p *AWS) AuthorizeRenew(ctx context.Context, cert *x509.Certificate) error {
-	if p.claimer.IsDisableRenewal() {
-		return errs.Unauthorized("aws.AuthorizeRenew; renew is disabled for aws provisioner %s", p.GetID())
-	}
-	return nil
+	return p.ctl.AuthorizeRenew(ctx, cert)
 }
 
 // assertConfig initializes the config if it has not been initialized
@@ -316,28 +407,113 @@ func (p *AWS) assertConfig() (err error) {
 	if p.config != nil {
 		return
 	}
-	p.config, err = newAWSConfig()
+	p.config, err = newAWSConfig(p.IIDRoots)
 	return err
 }
 
 // checkSignature returns an error if the signature is not valid.
 func (p *AWS) checkSignature(signed, signature []byte) error {
-	if err := p.config.certificate.CheckSignature(p.config.signatureAlgorithm, signed, signature); err != nil {
-		return errors.Wrap(err, "error validating identity document signature")
+	for _, crt := range p.config.certificates {
+		if err := crt.CheckSignature(p.config.signatureAlgorithm, signed, signature); err == nil {
+			return nil
+		}
 	}
-	return nil
+	return errors.New("error validating identity document signature")
 }
 
 // readURL does a GET request to the given url and returns the body. It's not
 // using pkg/errors to avoid verbose errors, the caller should use it and write
 // the appropriate error.
 func (p *AWS) readURL(url string) ([]byte, error) {
-	r, err := http.Get(url)
+	var resp *http.Response
+	var err error
+
+	// Initialize IMDS versions when this is called from the cli.
+	if len(p.IMDSVersions) == 0 {
+		p.IMDSVersions = []string{"v2", "v1"}
+	}
+
+	for _, v := range p.IMDSVersions {
+		switch v {
+		case "v1":
+			resp, err = p.readURLv1(url)
+			if err == nil && resp.StatusCode < 400 {
+				return p.readResponseBody(resp)
+			}
+		case "v2":
+			resp, err = p.readURLv2(url)
+			if err == nil && resp.StatusCode < 400 {
+				return p.readResponseBody(resp)
+			}
+		default:
+			return nil, fmt.Errorf("%s: not a supported AWS Instance Metadata Service version", v)
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+	}
+
+	// all versions have been exhausted and we haven't returned successfully yet so pass
+	// the error on to the caller
 	if err != nil {
 		return nil, err
 	}
-	defer r.Body.Close()
-	b, err := ioutil.ReadAll(r.Body)
+	return nil, fmt.Errorf("request for metadata returned non-successful status code %d",
+		resp.StatusCode)
+}
+
+func (p *AWS) readURLv1(url string) (*http.Response, error) {
+	client := http.Client{}
+
+	req, err := http.NewRequest(http.MethodGet, url, http.NoBody)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (p *AWS) readURLv2(url string) (*http.Response, error) {
+	client := http.Client{}
+
+	// first get the token
+	req, err := http.NewRequest(http.MethodPut, p.config.tokenURL, http.NoBody)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(awsMetadataTokenTTLHeader, p.config.tokenTTL)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("request for API token returned non-successful status code %d", resp.StatusCode)
+	}
+	token, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	// now make the request
+	req, err = http.NewRequest(http.MethodGet, url, http.NoBody)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set(awsMetadataTokenHeader, string(token))
+	resp, err = client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (p *AWS) readResponseBody(resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -398,7 +574,7 @@ func (p *AWS) authorizeToken(token string) (*awsPayload, error) {
 	}
 
 	// validate audiences with the defaults
-	if !matchesAudience(payload.Audience, p.audiences.Sign) {
+	if !matchesAudience(payload.Audience, p.ctl.Audiences.Sign) {
 		return nil, errs.Unauthorized("aws.authorizeToken; invalid token - invalid audience claim (aud)")
 	}
 
@@ -406,7 +582,7 @@ func (p *AWS) authorizeToken(token string) (*awsPayload, error) {
 	if p.DisableCustomSANs {
 		if payload.Subject != doc.InstanceID &&
 			payload.Subject != doc.PrivateIP &&
-			payload.Subject != fmt.Sprintf("ip-%s.%s.compute.internal", strings.Replace(doc.PrivateIP, ".", "-", -1), doc.Region) {
+			payload.Subject != fmt.Sprintf("ip-%s.%s.compute.internal", strings.ReplaceAll(doc.PrivateIP, ".", "-"), doc.Region) {
 			return nil, errs.Unauthorized("aws.authorizeToken; invalid token - invalid subject claim (sub)")
 		}
 	}
@@ -437,9 +613,9 @@ func (p *AWS) authorizeToken(token string) (*awsPayload, error) {
 }
 
 // AuthorizeSSHSign returns the list of SignOption for a SignSSH request.
-func (p *AWS) AuthorizeSSHSign(ctx context.Context, token string) ([]SignOption, error) {
-	if !p.claimer.IsSSHCAEnabled() {
-		return nil, errs.Unauthorized("aws.AuthorizeSSHSign; ssh ca is disabled for aws provisioner %s", p.GetID())
+func (p *AWS) AuthorizeSSHSign(_ context.Context, token string) ([]SignOption, error) {
+	if !p.ctl.Claimer.IsSSHCAEnabled() {
+		return nil, errs.Unauthorized("aws.AuthorizeSSHSign; ssh ca is disabled for aws provisioner '%s'", p.GetName())
 	}
 	claims, err := p.authorizeToken(token)
 	if err != nil {
@@ -447,42 +623,60 @@ func (p *AWS) AuthorizeSSHSign(ctx context.Context, token string) ([]SignOption,
 	}
 
 	doc := claims.document
+	signOptions := []SignOption{}
 
-	signOptions := []SignOption{
-		// set the key id to the instance id
-		sshCertKeyIDModifier(doc.InstanceID),
+	// Enforce host certificate.
+	defaults := SignSSHOptions{
+		CertType: SSHHostCert,
+	}
+
+	// Validated principals.
+	principals := []string{
+		doc.PrivateIP,
+		fmt.Sprintf("ip-%s.%s.compute.internal", strings.ReplaceAll(doc.PrivateIP, ".", "-"), doc.Region),
 	}
 
 	// Only enforce known principals if disable custom sans is true.
-	var principals []string
 	if p.DisableCustomSANs {
-		principals = []string{
-			doc.PrivateIP,
-			fmt.Sprintf("ip-%s.%s.compute.internal", strings.Replace(doc.PrivateIP, ".", "-", -1), doc.Region),
-		}
+		defaults.Principals = principals
+	} else {
+		// Check that at least one principal is sent in the request.
+		signOptions = append(signOptions, &sshCertOptionsRequireValidator{
+			Principals: true,
+		})
 	}
 
-	// Default to cert type to host
-	defaults := SSHOptions{
-		CertType:   SSHHostCert,
-		Principals: principals,
+	// Certificate templates.
+	data := sshutil.CreateTemplateData(sshutil.HostCert, doc.InstanceID, principals)
+	if v, err := unsafeParseSigned(token); err == nil {
+		data.SetToken(v)
 	}
 
-	// Validate user options
-	signOptions = append(signOptions, sshCertOptionsValidator(defaults))
-	// Set defaults if not given as user options
-	signOptions = append(signOptions, sshCertDefaultsModifier(defaults))
+	templateOptions, err := CustomSSHTemplateOptions(p.Options, data, sshutil.DefaultIIDTemplate)
+	if err != nil {
+		return nil, errs.Wrap(http.StatusInternalServerError, err, "aws.AuthorizeSSHSign")
+	}
+	signOptions = append(signOptions, templateOptions)
 
 	return append(signOptions,
-		// Set the default extensions.
-		&sshDefaultExtensionModifier{},
+		p,
+		// Validate user SignSSHOptions.
+		sshCertOptionsValidator(defaults),
 		// Set the validity bounds if not set.
-		&sshDefaultDuration{p.claimer},
+		&sshDefaultDuration{p.ctl.Claimer},
 		// Validate public key
 		&sshDefaultPublicKeyValidator{},
 		// Validate the validity period.
-		&sshCertValidityValidator{p.claimer},
+		&sshCertValidityValidator{p.ctl.Claimer},
 		// Require all the fields in the SSH certificate
 		&sshCertDefaultValidator{},
+		// Ensure that all principal names are allowed
+		newSSHNamePolicyValidator(p.ctl.getPolicy().getSSHHost(), nil),
+		// Call webhooks
+		p.ctl.newWebhookController(
+			data,
+			linkedca.Webhook_SSH,
+			webhook.WithAuthorizationPrincipal(doc.InstanceID),
+		),
 	), nil
 }

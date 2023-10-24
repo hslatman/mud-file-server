@@ -43,15 +43,19 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 // HTTPS serves mux for all domainNames using the HTTP
 // and HTTPS ports, redirecting all HTTP requests to HTTPS.
-// It uses the Default config.
+// It uses the Default config and a background context.
 //
 // This high-level convenience function is opinionated and
 // applies sane defaults for production use, including
@@ -66,6 +70,8 @@ import (
 // Calling this function signifies your acceptance to
 // the CA's Subscriber Agreement and/or Terms of Service.
 func HTTPS(domainNames []string, mux http.Handler) error {
+	ctx := context.Background()
+
 	if mux == nil {
 		mux = http.DefaultServeMux
 	}
@@ -73,7 +79,7 @@ func HTTPS(domainNames []string, mux http.Handler) error {
 	DefaultACME.Agreed = true
 	cfg := NewDefault()
 
-	err := cfg.ManageSync(domainNames)
+	err := cfg.ManageSync(ctx, domainNames)
 	if err != nil {
 		return err
 	}
@@ -91,7 +97,10 @@ func HTTPS(domainNames []string, mux http.Handler) error {
 			return err
 		}
 
-		httpsLn, err = tls.Listen("tcp", fmt.Sprintf(":%d", HTTPSPort), cfg.TLSConfig())
+		tlsConfig := cfg.TLSConfig()
+		tlsConfig.NextProtos = append([]string{"h2", "http/1.1"}, tlsConfig.NextProtos...)
+
+		httpsLn, err = tls.Listen("tcp", fmt.Sprintf(":%d", HTTPSPort), tlsConfig)
 		if err != nil {
 			httpLn.Close()
 			httpLn = nil
@@ -121,9 +130,12 @@ func HTTPS(domainNames []string, mux http.Handler) error {
 		ReadTimeout:       5 * time.Second,
 		WriteTimeout:      5 * time.Second,
 		IdleTimeout:       5 * time.Second,
+		BaseContext:       func(listener net.Listener) context.Context { return ctx },
 	}
-	if am, ok := cfg.Issuer.(*ACMEManager); ok {
-		httpServer.Handler = am.HTTPChallengeHandler(http.HandlerFunc(httpRedirectHandler))
+	if len(cfg.Issuers) > 0 {
+		if am, ok := cfg.Issuers[0].(*ACMEIssuer); ok {
+			httpServer.Handler = am.HTTPChallengeHandler(http.HandlerFunc(httpRedirectHandler))
+		}
 	}
 	httpsServer := &http.Server{
 		ReadHeaderTimeout: 10 * time.Second,
@@ -131,6 +143,7 @@ func HTTPS(domainNames []string, mux http.Handler) error {
 		WriteTimeout:      2 * time.Minute,
 		IdleTimeout:       5 * time.Minute,
 		Handler:           mux,
+		BaseContext:       func(listener net.Listener) context.Context { return ctx },
 	}
 
 	log.Printf("%v Serving HTTP->HTTPS on %s and %s",
@@ -173,7 +186,7 @@ func TLS(domainNames []string) (*tls.Config, error) {
 	DefaultACME.Agreed = true
 	DefaultACME.DisableHTTPChallenge = true
 	cfg := NewDefault()
-	return cfg.TLSConfig(), cfg.ManageSync(domainNames)
+	return cfg.TLSConfig(), cfg.ManageSync(context.Background(), domainNames)
 }
 
 // Listen manages certificates for domainName and returns a
@@ -190,7 +203,7 @@ func Listen(domainNames []string) (net.Listener, error) {
 	DefaultACME.Agreed = true
 	DefaultACME.DisableHTTPChallenge = true
 	cfg := NewDefault()
-	err := cfg.ManageSync(domainNames)
+	err := cfg.ManageSync(context.Background(), domainNames)
 	if err != nil {
 		return nil, err
 	}
@@ -218,9 +231,9 @@ func Listen(domainNames []string) (net.Listener, error) {
 //
 // Calling this function signifies your acceptance to
 // the CA's Subscriber Agreement and/or Terms of Service.
-func ManageSync(domainNames []string) error {
+func ManageSync(ctx context.Context, domainNames []string) error {
 	DefaultACME.Agreed = true
-	return NewDefault().ManageSync(domainNames)
+	return NewDefault().ManageSync(ctx, domainNames)
 }
 
 // ManageAsync is the same as ManageSync, except that
@@ -257,7 +270,16 @@ type OnDemandConfig struct {
 	// request will be denied.
 	DecisionFunc func(name string) error
 
-	// List of whitelisted hostnames (SNI values) for
+	// Sources for getting new, unmanaged certificates.
+	// They will be invoked only during TLS handshakes
+	// before on-demand certificate management occurs,
+	// for certificates that are not already loaded into
+	// the in-memory cache.
+	//
+	// TODO: EXPERIMENTAL: subject to change and/or removal.
+	Managers []Manager
+
+	// List of allowed hostnames (SNI values) for
 	// deferred (on-demand) obtaining of certificates.
 	// Used only by higher-level functions in this
 	// package to persist the list of hostnames that
@@ -269,20 +291,15 @@ type OnDemandConfig struct {
 	// for higher-level convenience functions to be
 	// able to retain their convenience (alternative
 	// is: the user manually creates a DecisionFunc
-	// that whitelists the same names it already
-	// passed into Manage) and without letting clients
-	// have their run of any domain names they want.
-	// Only enforced if len > 0.
-	hostWhitelist []string
-}
-
-func (o *OnDemandConfig) whitelistContains(name string) bool {
-	for _, n := range o.hostWhitelist {
-		if strings.EqualFold(n, name) {
-			return true
-		}
-	}
-	return false
+	// that allows the same names it already passed
+	// into Manage) and without letting clients have
+	// their run of any domain names they want.
+	// Only enforced if len > 0. (This is a map to
+	// avoid O(n^2) performance; when it was a slice,
+	// we saw a 30s CPU profile for a config managing
+	// 110K names where 29s was spent checking for
+	// duplicates. Order is not important here.)
+	hostAllowlist map[string]struct{}
 }
 
 // isLoopback returns true if the hostname of addr looks
@@ -336,7 +353,7 @@ func hostOnly(hostport string) string {
 // identical calls) to Issue(), giving the issuer the option to ensure
 // it has all the necessary information/state.
 type PreChecker interface {
-	PreCheck(names []string, interactive bool) error
+	PreCheck(ctx context.Context, names []string, interactive bool) error
 }
 
 // Issuer is a type that can issue certificates.
@@ -362,9 +379,23 @@ type Issuer interface {
 	IssuerKey() string
 }
 
-// Revoker can revoke certificates.
+// Revoker can revoke certificates. Reason codes are defined
+// by RFC 5280 §5.3.1: https://tools.ietf.org/html/rfc5280#section-5.3.1
+// and are available as constants in our ACME library.
 type Revoker interface {
-	Revoke(ctx context.Context, cert CertificateResource) error
+	Revoke(ctx context.Context, cert CertificateResource, reason int) error
+}
+
+// Manager is a type that manages certificates (keeps them renewed) such
+// that we can get certificates during TLS handshakes to immediately serve
+// to clients.
+//
+// TODO: This is an EXPERIMENTAL API. It is subject to change/removal.
+type Manager interface {
+	// GetCertificate returns the certificate to use to complete the handshake.
+	// Since this is called during every TLS handshake, it must be very fast and not block.
+	// Returning (nil, nil) is valid and is simply treated as a no-op.
+	GetCertificate(context.Context, *tls.ClientHelloInfo) (*tls.Certificate, error)
 }
 
 // KeyGenerator can generate a private key.
@@ -375,6 +406,23 @@ type KeyGenerator interface {
 	GenerateKey() (crypto.PrivateKey, error)
 }
 
+// IssuerPolicy is a type that enumerates how to
+// choose which issuer to use. EXPERIMENTAL and
+// subject to change.
+type IssuerPolicy string
+
+// Supported issuer policies. These are subject to change.
+const (
+	// UseFirstIssuer uses the first issuer that
+	// successfully returns a certificate.
+	UseFirstIssuer = "first"
+
+	// UseFirstRandomIssuer shuffles the list of
+	// configured issuers, then uses the first one
+	// that successfully returns a certificate.
+	UseFirstRandomIssuer = "first_random"
+)
+
 // IssuedCertificate represents a certificate that was just issued.
 type IssuedCertificate struct {
 	// The PEM-encoding of DER-encoded ASN.1 data.
@@ -382,7 +430,7 @@ type IssuedCertificate struct {
 
 	// Any extra information to serialize alongside the
 	// certificate in storage.
-	Metadata interface{}
+	Metadata any
 }
 
 // CertificateResource associates a certificate with its private
@@ -402,7 +450,11 @@ type CertificateResource struct {
 
 	// Any extra information associated with the certificate,
 	// usually provided by the issuer implementation.
-	IssuerData interface{} `json:"issuer_data,omitempty"`
+	IssuerData any `json:"issuer_data,omitempty"`
+
+	// The unique string identifying the issuer of the
+	// certificate; internally useful for storage access.
+	issuerKey string
 }
 
 // NamesKey returns the list of SANs as a single string,
@@ -420,9 +472,11 @@ func (cr *CertificateResource) NamesKey() string {
 
 // Default contains the package defaults for the
 // various Config fields. This is used as a template
-// when creating your own Configs with New(), and it
-// is also used as the Config by all the high-level
-// functions in this package.
+// when creating your own Configs with New() or
+// NewDefault(), and it is also used as the Config
+// by all the high-level functions in this package
+// that abstract away most configuration (HTTPS(),
+// TLS(), Listen(), etc).
 //
 // The fields of this value will be used for Config
 // fields which are unset. Feel free to modify these
@@ -431,13 +485,23 @@ func (cr *CertificateResource) NamesKey() string {
 // obtained by calling New() (if you have your own
 // certificate cache) or NewDefault() (if you only
 // need a single config and want to use the default
-// cache). This is the only Config which can access
-// the default certificate cache.
+// cache).
+//
+// Even if the Issuers or Storage fields are not set,
+// defaults will be applied in the call to New().
 var Default = Config{
 	RenewalWindowRatio: DefaultRenewalWindowRatio,
 	Storage:            defaultFileStorage,
 	KeySource:          DefaultKeyGenerator,
+	Logger:             defaultLogger,
 }
+
+// defaultLogger is guaranteed to be a non-nil fallback logger.
+var defaultLogger = zap.New(zapcore.NewCore(
+	zapcore.NewConsoleEncoder(zap.NewProductionEncoderConfig()),
+	os.Stderr,
+	zap.InfoLevel,
+))
 
 const (
 	// HTTPChallengePort is the officially-designated port for
@@ -454,12 +518,12 @@ const (
 // are set to; otherwise ACME challenges will fail.
 var (
 	// HTTPPort is the port on which to serve HTTP
-	// and, by extension, the HTTP challenge (unless
+	// and, as such, the HTTP challenge (unless
 	// Default.AltHTTPPort is set).
 	HTTPPort = 80
 
 	// HTTPSPort is the port on which to serve HTTPS
-	// and, by extension, the TLS-ALPN challenge
+	// and, as such, the TLS-ALPN challenge
 	// (unless Default.AltTLSALPNPort is set).
 	HTTPSPort = 443
 )
@@ -472,4 +536,4 @@ var (
 )
 
 // Maximum size for the stack trace when recovering from panics.
-const stackTraceBufferSize = 1024 * 1024 * 64
+const stackTraceBufferSize = 1024 * 128

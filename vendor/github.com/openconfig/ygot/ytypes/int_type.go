@@ -56,6 +56,26 @@ var (
 	}
 )
 
+// ValidateIntRestrictions checks that the given signed int matches the
+// schema's range restrictions (if any). It returns an error if the validation
+// fails.
+func ValidateIntRestrictions(schemaType *yang.YangType, intVal int64) error {
+	if !isInRanges(schemaType.Range, yang.FromInt(intVal)) {
+		return fmt.Errorf("signed integer value %v is outside specified ranges", intVal)
+	}
+	return nil
+}
+
+// ValidateUintRestrictions checks that the given unsigned int matches the
+// schema's range restrictions (if any). It returns an error if the validation
+// fails.
+func ValidateUintRestrictions(schemaType *yang.YangType, uintVal uint64) error {
+	if !isInRanges(schemaType.Range, yang.FromUint(uintVal)) {
+		return fmt.Errorf("unsigned integer value %v is outside specified ranges", uintVal)
+	}
+	return nil
+}
+
 // validateInt validates value, which must be a Go integer type, against the
 // given schema.
 func validateInt(schema *yang.Entry, value interface{}) error {
@@ -67,7 +87,6 @@ func validateInt(schema *yang.Entry, value interface{}) error {
 	util.DbgPrint("validateInt type %s with value %v", util.YangTypeToDebugString(schema.Type), value)
 
 	kind := schema.Type.Kind
-	ranges := schema.Type.Range
 
 	// Check that type of value is the type expected from the schema.
 	if typeKindFromKind[reflect.TypeOf(value).Kind()] != kind {
@@ -76,12 +95,12 @@ func validateInt(schema *yang.Entry, value interface{}) error {
 
 	// Check that the value satisfies any range restrictions.
 	if isSigned(kind) {
-		if !isInRanges(ranges, yang.FromInt(reflect.ValueOf(value).Int())) {
-			return fmt.Errorf("integer value %v is outside specified ranges for schema %s", value, schema.Name)
+		if err := ValidateIntRestrictions(schema.Type, reflect.ValueOf(value).Int()); err != nil {
+			return fmt.Errorf("schema %q: %v", schema.Name, err)
 		}
 	} else {
-		if !isInRanges(ranges, yang.FromUint(reflect.ValueOf(value).Uint())) {
-			return fmt.Errorf("unsigned integer value %v is outside specified ranges for schema %s", value, schema.Name)
+		if err := ValidateUintRestrictions(schema.Type, reflect.ValueOf(value).Uint()); err != nil {
+			return fmt.Errorf("schema %q: %v", schema.Name, err)
 		}
 	}
 
@@ -127,8 +146,8 @@ func validateIntSlice(schema *yang.Entry, value interface{}) error {
 	return nil
 }
 
-// validateIntSchema validates the given integer type schema. This is a sanity
-// check validation rather than a comprehensive validation against the RFC.
+// validateIntSchema validates the given integer type schema. This is a quick
+// check rather than a comprehensive validation against the RFC.
 // It is assumed that such a validation is done when the schema is parsed from
 // source YANG.
 func validateIntSchema(schema *yang.Entry) error {
@@ -147,12 +166,10 @@ func validateIntSchema(schema *yang.Entry) error {
 
 	// Ensure ranges have valid value types.
 	for _, r := range ranges {
-		switch {
-		case r.Min.Kind != yang.MinNumber && r.Min.Kind != yang.Positive && r.Min.Kind != yang.Negative:
-			return fmt.Errorf("range %v min must be Positive, Negative or MinNumber for schema %s", r, schema.Name)
-		case r.Max.Kind != yang.MaxNumber && r.Max.Kind != yang.Positive && r.Max.Kind != yang.Negative:
-			return fmt.Errorf("range %v max must be Positive, Negative or MaxNumber for schema %s", r, schema.Name)
-		case !isSigned(kind) && (r.Min.Kind == yang.Negative || r.Max.Kind == yang.Negative):
+		if r.Max.Less(r.Min) {
+			return fmt.Errorf("int range cannot be a negative window %#v for schema %s", r, schema.Path())
+		}
+		if !isSigned(kind) && (r.Min.Negative || r.Max.Negative) {
 			return fmt.Errorf("unsigned int cannot have negative range boundaries %v for schema %s", r, schema.Name)
 		}
 	}
@@ -179,10 +196,6 @@ func validateIntSchema(schema *yang.Entry) error {
 // legalValue reports whether val is within the range allowed for the given
 // integer kind. kind must be an integer type.
 func legalValue(schema *yang.Entry, val yang.Number) bool {
-	if val.Kind == yang.MinNumber || val.Kind == yang.MaxNumber {
-		return true
-	}
-
 	yr := yang.YangRange{yang.YRange{Min: val, Max: val}}
 	switch schema.Type.Kind {
 	case yang.Yint8:

@@ -15,6 +15,7 @@
 package ygot
 
 import (
+	"fmt"
 	"reflect"
 )
 
@@ -30,9 +31,9 @@ type GoStruct interface {
 	IsYANGGoStruct()
 }
 
-// ValidatedGoStruct is an interface which can be implemented by Go structs
-// that are generated to represent a YANG container or list member that have
-// the corresponding function to be validated against the a YANG schema.
+// ValidatedGoStruct is an interface implemented by all Go structs (YANG
+// container or lists), *except* when the default validate_fn_name generation
+// flag is overridden.
 type ValidatedGoStruct interface {
 	// GoStruct ensures that the interface for a standard GoStruct
 	// is embedded.
@@ -44,6 +45,38 @@ type ValidatedGoStruct interface {
 	// ΛEnumTypeMap returns the set of enumerated types that are contained
 	// in the generated code.
 	ΛEnumTypeMap() map[string][]reflect.Type
+	// ΛBelongingModule returns the module in which the GoStruct was
+	// defined per https://datatracker.ietf.org/doc/html/rfc7951#section-4.
+	// If the GoStruct is the fakeroot, then the empty string will be
+	// returned.
+	//
+	// Strictly, this value is the name of the module having the same XML
+	// namespace as this node.
+	// For more information on YANG's XML namespaces see
+	// https://datatracker.ietf.org/doc/html/rfc7950#section-5.3
+	ΛBelongingModule() string
+}
+
+// ValidateGoStruct validates a GoStruct.
+func ValidateGoStruct(goStruct GoStruct, vopts ...ValidationOption) error {
+	vroot, ok := goStruct.(validatedGoStruct)
+	if !ok {
+		return fmt.Errorf("GoStruct cannot be validated: (%T, %v)", goStruct, goStruct)
+	}
+	return vroot.ΛValidate(vopts...)
+}
+
+// validatedGoStruct is an interface used for validating GoStructs.
+// This interface is implemented by all Go structs (YANG container or lists),
+// regardless of generation flag.
+type validatedGoStruct interface {
+	// GoStruct ensures that the interface for a standard GoStruct
+	// is embedded.
+	GoStruct
+	// ΛValidate compares the contents of the implementing struct against
+	// the YANG schema, and returns an error if the struct's contents
+	// are not valid, or nil if the struct complies with the schema.
+	ΛValidate(...ValidationOption) error
 }
 
 // ValidationOption is an interface that is implemented for each struct
@@ -53,6 +86,20 @@ type ValidationOption interface {
 	IsValidationOption()
 }
 
+// GoOrderedMap is an interface which can be implemented by Go structs that are
+// generated to represent a YANG "ordered-by user" list. It simply allows
+// handling code to ensure that it is interacting with a struct that will meet
+// the expectations of the interface - such as the existence of a Values()
+// method that allows the retrieval of the list elements within the ordered
+// list.
+type GoOrderedMap interface {
+	// IsYANGOrderedList is a marker method that indicates that the struct
+	// implements the GoOrderedMap interface.
+	IsYANGOrderedList()
+	// Len returns the size of the ordered list.
+	Len() int
+}
+
 // KeyHelperGoStruct is an interface which can be implemented by Go structs
 // that are generated to represent a YANG container or list member that has
 // the corresponding function to retrieve the list keys as a map.
@@ -60,6 +107,18 @@ type KeyHelperGoStruct interface {
 	// GoStruct ensures that the interface for a standard GoStruct
 	// is embedded.
 	GoStruct
+	// ΛListKeyMap defines a helper method that returns a map of the
+	// keys of a list element.
+	ΛListKeyMap() (map[string]interface{}, error)
+}
+
+// GoKeyStruct is an interface which can be implemented by Go key
+// structs that are generated to represent a YANG multi-keyed list's key that
+// has the corresponding function to retrieve the list keys as a map.
+type GoKeyStruct interface {
+	// IsYANGGoKeyStruct ensures that the interface for a standard
+	// GoKeyStruct is embedded.
+	IsYANGGoKeyStruct()
 	// ΛListKeyMap defines a helper method that returns a map of the
 	// keys of a list element.
 	ΛListKeyMap() (map[string]interface{}, error)
@@ -96,17 +155,29 @@ type EnumDefinition struct {
 	// DefiningModule specifies the module within which the enumeration was
 	// defined. Only populated for identity values.
 	DefiningModule string
+	// Value is an optionally-populated field that specifies the value of
+	// an enumerated type.
+	//
+	// TODO: Consider removing this field and using a custom type in the
+	// ygen package since only the IR generation populates this field.
+	//
+	// When populated, the following values are recommended:
+	// For enumerations, this value is determined by goyang.
+	// For identityrefs, this value is determined by the lexicographical
+	// ordering of the identityref name, starting with 0 to be consistent
+	// with goyang's enumeration numbering.
+	Value int
 }
 
 // Annotation defines an interface that is implemented by optional metadata
 // fields within a GoStruct. Annotations are stored within each struct, and
 // for a struct field, for example:
 //
-//  type GoStructExample struct {
-//     ΛMetadata []*ygot.Annotation `path:"@"`
-//     StringField *string `path:"string-field"`
-//     ΛStringField []*ygot.Annotation `path:"@string-field"`
-//  }
+//	type GoStructExample struct {
+//	   ΛMetadata []*ygot.Annotation `path:"@"`
+//	   StringField *string `path:"string-field"`
+//	   ΛStringField []*ygot.Annotation `path:"@string-field"`
+//	}
 //
 // The ΛMetadata and ΛStringField fields can be populated with a slice of
 // arbitrary types implementing the Annotation interface.

@@ -16,91 +16,145 @@ package certmagic
 
 import (
 	"context"
-	"crypto/tls"
+	"crypto/x509"
 	"fmt"
-	"log"
 	weakrand "math/rand"
 	"net"
-	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/go-acme/lego/v3/acme"
-	"github.com/go-acme/lego/v3/certificate"
-	"github.com/go-acme/lego/v3/challenge"
-	"github.com/go-acme/lego/v3/lego"
-	"github.com/go-acme/lego/v3/registration"
+	"github.com/mholt/acmez"
+	"github.com/mholt/acmez/acme"
+	"go.uber.org/zap"
 )
 
 func init() {
 	weakrand.Seed(time.Now().UnixNano())
 }
 
-// acmeClient is a wrapper over lego's acme.Client with
-// some custom state attached. It is used to obtain,
-// renew, and revoke certificates with ACME. Use
-// ACMEManager.newACMEClient() or
-// ACMEManager.newACMEClientWithRetry() to get a valid
-// one for real use.
+// acmeClient holds state necessary to perform ACME operations
+// for certificate management with an ACME account. Call
+// ACMEIssuer.newACMEClientWithAccount() to get a valid one.
 type acmeClient struct {
-	caURL      string
-	mgr        *ACMEManager
-	acmeClient *lego.Client
-	challenges []challenge.Type
+	iss        *ACMEIssuer
+	acmeClient *acmez.Client
+	account    acme.Account
 }
 
-// newACMEClientWithRetry is the same as newACMEClient, but with
-// automatic retry capabilities. Sometimes network connections or
-// HTTP requests fail intermittently, even when requesting the
-// directory endpoint for example, so we can avoid that by just
-// retrying once. Failures here are rare and sporadic, usually,
-// so a simple retry is an easy fix.
-func (am *ACMEManager) newACMEClientWithRetry(useTestCA bool) (*acmeClient, error) {
-	var client *acmeClient
-	var err error
-	const maxTries = 2
-	for i := 0; i < maxTries; i++ {
-		if i > 0 {
-			time.Sleep(2 * time.Second)
-		}
-		client, err = am.newACMEClient(useTestCA, false) // TODO: move logic that requires interactivity to way before this part of the process...
-		if err == nil {
-			break
-		}
-		if acmeErr, ok := err.(acme.ProblemDetails); ok {
-			if acmeErr.HTTPStatus == http.StatusTooManyRequests {
-				return nil, fmt.Errorf("too many requests making new ACME client: %+v - aborting", acmeErr)
+// newACMEClientWithAccount creates an ACME client ready to use with an account, including
+// loading one from storage or registering a new account with the CA if necessary. If
+// useTestCA is true, am.TestCA will be used if set; otherwise, the primary CA will be used.
+func (iss *ACMEIssuer) newACMEClientWithAccount(ctx context.Context, useTestCA, interactive bool) (*acmeClient, error) {
+	// first, get underlying ACME client
+	client, err := iss.newACMEClient(useTestCA)
+	if err != nil {
+		return nil, err
+	}
+
+	// look up or create the ACME account
+	var account acme.Account
+	if iss.AccountKeyPEM != "" {
+		account, err = iss.GetAccount(ctx, []byte(iss.AccountKeyPEM))
+	} else {
+		account, err = iss.getAccount(ctx, client.Directory, iss.getEmail())
+	}
+	if err != nil {
+		return nil, fmt.Errorf("getting ACME account: %v", err)
+	}
+
+	// register account if it is new
+	if account.Status == "" {
+		if iss.NewAccountFunc != nil {
+			// obtain lock here, since NewAccountFunc calls happen concurrently and they typically read and change the issuer
+			iss.mu.Lock()
+			account, err = iss.NewAccountFunc(ctx, iss, account)
+			iss.mu.Unlock()
+			if err != nil {
+				return nil, fmt.Errorf("account pre-registration callback: %v", err)
 			}
 		}
-		log.Printf("[ERROR] Making new ACME client: %v (attempt %d/%d)", err, i+1, maxTries)
+
+		// agree to terms
+		if interactive {
+			if !iss.isAgreed() {
+				var termsURL string
+				dir, err := client.GetDirectory(ctx)
+				if err != nil {
+					return nil, fmt.Errorf("getting directory: %w", err)
+				}
+				if dir.Meta != nil {
+					termsURL = dir.Meta.TermsOfService
+				}
+				if termsURL != "" {
+					agreed := iss.askUserAgreement(termsURL)
+					if !agreed {
+						return nil, fmt.Errorf("user must agree to CA terms")
+					}
+					iss.mu.Lock()
+					iss.agreed = agreed
+					iss.mu.Unlock()
+				}
+			}
+		} else {
+			// can't prompt a user who isn't there; they should
+			// have reviewed the terms beforehand
+			iss.mu.Lock()
+			iss.agreed = true
+			iss.mu.Unlock()
+		}
+		account.TermsOfServiceAgreed = iss.isAgreed()
+
+		// associate account with external binding, if configured
+		if iss.ExternalAccount != nil {
+			err := account.SetExternalAccountBinding(ctx, client.Client, *iss.ExternalAccount)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// create account
+		account, err = client.NewAccount(ctx, account)
+		if err != nil {
+			return nil, fmt.Errorf("registering account %v with server: %w", account.Contact, err)
+		}
+
+		// persist the account to storage
+		err = iss.saveAccount(ctx, client.Directory, account)
+		if err != nil {
+			return nil, fmt.Errorf("could not save account %v: %v", account.Contact, err)
+		}
 	}
-	return client, err
+
+	c := &acmeClient{
+		iss:        iss,
+		acmeClient: client,
+		account:    account,
+	}
+
+	return c, nil
 }
 
-// newACMEClient creates the underlying ACME library client type.
-// If useTestCA is true, am.TestCA will be used if it is set;
-// otherwise, the primary CA will still be used.
-func (am *ACMEManager) newACMEClient(useTestCA, interactive bool) (*acmeClient, error) {
-	acmeClientsMu.Lock()
-	defer acmeClientsMu.Unlock()
-
+// newACMEClient creates a new underlying ACME client using the settings in am,
+// independent of any particular ACME account. If useTestCA is true, am.TestCA
+// will be used if it is set; otherwise, the primary CA will be used.
+func (iss *ACMEIssuer) newACMEClient(useTestCA bool) (*acmez.Client, error) {
 	// ensure defaults are filled in
-	certObtainTimeout := am.CertObtainTimeout
-	if certObtainTimeout == 0 {
-		certObtainTimeout = DefaultACME.CertObtainTimeout
-	}
 	var caURL string
 	if useTestCA {
-		caURL = am.TestCA
+		caURL = iss.TestCA
 	}
 	if caURL == "" {
-		caURL = am.CA
+		caURL = iss.CA
 	}
 	if caURL == "" {
 		caURL = DefaultACME.CA
+	}
+	certObtainTimeout := iss.CertObtainTimeout
+	if certObtainTimeout == 0 {
+		certObtainTimeout = DefaultACME.CertObtainTimeout
 	}
 
 	// ensure endpoint is secure (assume HTTPS if scheme is missing)
@@ -115,189 +169,90 @@ func (am *ACMEManager) newACMEClient(useTestCA, interactive bool) (*acmeClient, 
 		return nil, fmt.Errorf("%s: insecure CA URL (HTTPS required)", caURL)
 	}
 
-	// look up or create the user account
-	leUser, err := am.getUser(caURL, am.Email)
-	if err != nil {
-		return nil, err
+	client := &acmez.Client{
+		Client: &acme.Client{
+			Directory:   caURL,
+			PollTimeout: certObtainTimeout,
+			UserAgent:   buildUAString(),
+			HTTPClient:  iss.httpClient,
+		},
+		ChallengeSolvers: make(map[string]acmez.Solver),
 	}
+	client.Logger = iss.Logger.Named("acme_client")
 
-	// if a lego client with this configuration already exists, reuse it
-	clientKey := caURL + leUser.Email
-	client, ok := acmeClients[clientKey]
-	if !ok {
-		// the client facilitates our communication with the CA server
-		legoCfg := lego.NewConfig(leUser)
-		legoCfg.CADirURL = caURL
-		legoCfg.UserAgent = buildUAString()
-		legoCfg.HTTPClient.Timeout = HTTPTimeout
-		legoCfg.Certificate = lego.CertificateConfig{
-			Timeout: am.CertObtainTimeout,
-		}
-		if am.TrustedRoots != nil {
-			if ht, ok := legoCfg.HTTPClient.Transport.(*http.Transport); ok {
-				if ht.TLSClientConfig == nil {
-					ht.TLSClientConfig = new(tls.Config)
-					ht.ForceAttemptHTTP2 = true
-				}
-				ht.TLSClientConfig.RootCAs = am.TrustedRoots
+	// configure challenges (most of the time, DNS challenge is
+	// exclusive of other ones because it is usually only used
+	// in situations where the default challenges would fail)
+	if iss.DNS01Solver == nil {
+		// enable HTTP-01 challenge
+		if !iss.DisableHTTPChallenge {
+			useHTTPPort := HTTPChallengePort
+			if HTTPPort > 0 && HTTPPort != HTTPChallengePort {
+				useHTTPPort = HTTPPort
 			}
-		}
-		client, err = lego.NewClient(legoCfg)
-		if err != nil {
-			return nil, err
-		}
-		acmeClients[clientKey] = client
-	}
-
-	// if not registered, the user must register an account
-	// with the CA and agree to terms
-	if leUser.Registration == nil {
-		if interactive { // can't prompt a user who isn't there
-			termsURL := client.GetToSURL()
-			if !am.Agreed && termsURL != "" {
-				am.Agreed = am.askUserAgreement(client.GetToSURL())
+			if iss.AltHTTPPort > 0 {
+				useHTTPPort = iss.AltHTTPPort
 			}
-			if !am.Agreed && termsURL != "" {
-				return nil, fmt.Errorf("user must agree to CA terms")
+			client.ChallengeSolvers[acme.ChallengeTypeHTTP01] = distributedSolver{
+				storage:                iss.config.Storage,
+				storageKeyIssuerPrefix: iss.storageKeyCAPrefix(client.Directory),
+				solver: &httpSolver{
+					acmeIssuer: iss,
+					address:    net.JoinHostPort(iss.ListenHost, strconv.Itoa(useHTTPPort)),
+				},
 			}
 		}
 
-		var reg *registration.Resource
-		if am.ExternalAccount != nil {
-			reg, err = client.Registration.RegisterWithExternalAccountBinding(registration.RegisterEABOptions{
-				TermsOfServiceAgreed: am.Agreed,
-				Kid:                  am.ExternalAccount.KeyID,
-				HmacEncoded:          am.ExternalAccount.HMAC,
-			})
-		} else {
-			reg, err = client.Registration.Register(registration.RegisterOptions{
-				TermsOfServiceAgreed: am.Agreed,
-			})
+		// enable TLS-ALPN-01 challenge
+		if !iss.DisableTLSALPNChallenge {
+			useTLSALPNPort := TLSALPNChallengePort
+			if HTTPSPort > 0 && HTTPSPort != TLSALPNChallengePort {
+				useTLSALPNPort = HTTPSPort
+			}
+			if iss.AltTLSALPNPort > 0 {
+				useTLSALPNPort = iss.AltTLSALPNPort
+			}
+			client.ChallengeSolvers[acme.ChallengeTypeTLSALPN01] = distributedSolver{
+				storage:                iss.config.Storage,
+				storageKeyIssuerPrefix: iss.storageKeyCAPrefix(client.Directory),
+				solver: &tlsALPNSolver{
+					config:  iss.config,
+					address: net.JoinHostPort(iss.ListenHost, strconv.Itoa(useTLSALPNPort)),
+				},
+			}
 		}
-		if err != nil {
-			return nil, err
-		}
-		leUser.Registration = reg
-
-		// persist the user to storage
-		err = am.saveUser(caURL, leUser)
-		if err != nil {
-			return nil, fmt.Errorf("could not save user: %v", err)
-		}
+	} else {
+		// use DNS challenge exclusively
+		client.ChallengeSolvers[acme.ChallengeTypeDNS01] = iss.DNS01Solver
 	}
 
-	c := &acmeClient{
-		caURL:      caURL,
-		mgr:        am,
-		acmeClient: client,
+	// wrap solvers in our wrapper so that we can keep track of challenge
+	// info: this is useful for solving challenges globally as a process;
+	// for example, usually there is only one process that can solve the
+	// HTTP and TLS-ALPN challenges, and only one server in that process
+	// that can bind the necessary port(s), so if a server listening on
+	// a different port needed a certificate, it would have to know about
+	// the other server listening on that port, and somehow convey its
+	// challenge info or share its config, but this isn't always feasible;
+	// what the wrapper does is it accesses a global challenge memory so
+	// that unrelated servers in this process can all solve each others'
+	// challenges without having to know about each other - Caddy's admin
+	// endpoint uses this functionality since it and the HTTP/TLS modules
+	// do not know about each other
+	// (doing this here in a separate loop ensures that even if we expose
+	// solver config to users later, we will even wrap their own solvers)
+	for name, solver := range client.ChallengeSolvers {
+		client.ChallengeSolvers[name] = solverWrapper{solver}
 	}
 
-	return c, nil
-}
-
-// initialChallenges returns the initial set of challenges
-// to try using c.config as a basis.
-func (c *acmeClient) initialChallenges() []challenge.Type {
-	// if configured, use DNS challenge exclusively
-	if c.mgr.DNSProvider != nil {
-		return []challenge.Type{challenge.DNS01}
-	}
-
-	// otherwise, use HTTP and TLS-ALPN challenges if enabled
-	var chal []challenge.Type
-	if !c.mgr.DisableHTTPChallenge {
-		chal = append(chal, challenge.HTTP01)
-	}
-	if !c.mgr.DisableTLSALPNChallenge {
-		chal = append(chal, challenge.TLSALPN01)
-	}
-	return chal
-}
-
-// nextChallenge chooses a challenge randomly from the given list of
-// available challenges and configures c.acmeClient to use that challenge
-// according to c.config. It pops the chosen challenge from the list and
-// returns that challenge along with the new list without that challenge.
-// If len(available) == 0, this is a no-op.
-//
-// Don't even get me started on how dumb it is we need to do this here
-// instead of the upstream lego library doing it for us. Lego used to
-// randomize the challenge order, thus allowing another one to be used
-// if the first one failed. https://github.com/go-acme/lego/issues/842
-// (It also has an awkward API for adjusting the available challenges.)
-// At time of writing, lego doesn't try anything other than the TLS-ALPN
-// challenge, even if the HTTP challenge is also enabled. So we take
-// matters into our own hands and enable only one challenge at a time
-// in the underlying client, randomly selected by us.
-func (c *acmeClient) nextChallenge(available []challenge.Type) (challenge.Type, []challenge.Type) {
-	if len(available) == 0 {
-		return "", available
-	}
-
-	// make sure we choose a challenge randomly, which lego used to do but
-	// the critical feature was surreptitiously removed in ~2018 in a commit
-	// too large to review, oh well - choose one, then remove it from the
-	// list of available challenges so it doesn't get retried
-	randIdx := weakrand.Intn(len(available))
-	randomChallenge := available[randIdx]
-	available = append(available[:randIdx], available[randIdx+1:]...)
-
-	// clean the slate, since we reuse clients
-	c.acmeClient.Challenge.Remove(challenge.HTTP01)
-	c.acmeClient.Challenge.Remove(challenge.TLSALPN01)
-	c.acmeClient.Challenge.Remove(challenge.DNS01)
-
-	switch randomChallenge {
-	case challenge.HTTP01:
-		useHTTPPort := HTTPChallengePort
-		if HTTPPort > 0 && HTTPPort != HTTPChallengePort {
-			useHTTPPort = HTTPPort
-		}
-		if c.mgr.AltHTTPPort > 0 {
-			useHTTPPort = c.mgr.AltHTTPPort
-		}
-
-		c.acmeClient.Challenge.SetHTTP01Provider(distributedSolver{
-			acmeManager: c.mgr,
-			providerServer: &httpSolver{
-				acmeManager: c.mgr,
-				address:     net.JoinHostPort(c.mgr.ListenHost, strconv.Itoa(useHTTPPort)),
-			},
-			caURL: c.caURL,
-		})
-
-	case challenge.TLSALPN01:
-		useTLSALPNPort := TLSALPNChallengePort
-		if HTTPSPort > 0 && HTTPSPort != TLSALPNChallengePort {
-			useTLSALPNPort = HTTPSPort
-		}
-		if c.mgr.AltTLSALPNPort > 0 {
-			useTLSALPNPort = c.mgr.AltTLSALPNPort
-		}
-
-		c.acmeClient.Challenge.SetTLSALPN01Provider(distributedSolver{
-			acmeManager: c.mgr,
-			providerServer: &tlsALPNSolver{
-				config:  c.mgr.config,
-				address: net.JoinHostPort(c.mgr.ListenHost, strconv.Itoa(useTLSALPNPort)),
-			},
-			caURL: c.caURL,
-		})
-
-	case challenge.DNS01:
-		if c.mgr.DNSChallengeOption != nil {
-			c.acmeClient.Challenge.SetDNS01Provider(c.mgr.DNSProvider, c.mgr.DNSChallengeOption)
-		} else {
-			c.acmeClient.Challenge.SetDNS01Provider(c.mgr.DNSProvider)
-		}
-	}
-
-	return randomChallenge, available
+	return client, nil
 }
 
 func (c *acmeClient) throttle(ctx context.Context, names []string) error {
+	email := c.iss.getEmail()
+
 	// throttling is scoped to CA + account email
-	rateLimiterKey := c.caURL + "," + c.mgr.Email
+	rateLimiterKey := c.acmeClient.Directory + "," + email
 	rateLimitersMu.Lock()
 	rl, ok := rateLimiters[rateLimiterKey]
 	if !ok {
@@ -306,27 +261,36 @@ func (c *acmeClient) throttle(ctx context.Context, names []string) error {
 		// TODO: stop rate limiter when it is garbage-collected...
 	}
 	rateLimitersMu.Unlock()
-	log.Printf("[INFO]%v Waiting on rate limiter...", names)
+	c.iss.Logger.Info("waiting on internal rate limiter",
+		zap.Strings("identifiers", names),
+		zap.String("ca", c.acmeClient.Directory),
+		zap.String("account", email),
+	)
 	err := rl.Wait(ctx)
 	if err != nil {
 		return err
 	}
-	log.Printf("[INFO]%v Done waiting", names)
+	c.iss.Logger.Info("done waiting on internal rate limiter",
+		zap.Strings("identifiers", names),
+		zap.String("ca", c.acmeClient.Directory),
+		zap.String("account", email),
+	)
 	return nil
 }
 
 func (c *acmeClient) usingTestCA() bool {
-	return c.mgr.TestCA != "" && c.caURL == c.mgr.TestCA
+	return c.iss.TestCA != "" && c.acmeClient.Directory == c.iss.TestCA
 }
 
-func (c *acmeClient) revoke(_ context.Context, certRes certificate.Resource) error {
-	return c.acmeClient.Certificate.Revoke(certRes.Certificate)
+func (c *acmeClient) revoke(ctx context.Context, cert *x509.Certificate, reason int) error {
+	return c.acmeClient.RevokeCertificate(ctx, c.account,
+		cert, c.account.PrivateKey, reason)
 }
 
 func buildUAString() string {
 	ua := "CertMagic"
 	if UserAgent != "" {
-		ua += " " + UserAgent
+		ua = UserAgent + " " + ua
 	}
 	return ua
 }
@@ -370,25 +334,11 @@ var (
 
 	// RateLimitEventsWindow is the size of the sliding
 	// window that throttles events.
-	RateLimitEventsWindow = 1 * time.Minute
+	RateLimitEventsWindow = 10 * time.Second
 )
 
-// Some default values passed down to the underlying lego client.
+// Some default values passed down to the underlying ACME client.
 var (
 	UserAgent   string
 	HTTPTimeout = 30 * time.Second
-)
-
-// We keep a global cache of ACME clients so that they
-// can be reused. Since the number of CAs, accounts,
-// and key types should be fairly limited under best
-// practices, this map will hardly ever have more than
-// a few entries at the most. The associated lock
-// protects access to the map but also ensures that only
-// one ACME client is created at a time.
-// TODO: consider using storage for a distributed lock
-// TODO: consider evicting clients after some time
-var (
-	acmeClients   = make(map[string]*lego.Client)
-	acmeClientsMu sync.Mutex
 )

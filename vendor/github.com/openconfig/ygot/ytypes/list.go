@@ -21,7 +21,9 @@ import (
 
 	"github.com/kylelemons/godebug/pretty"
 	"github.com/openconfig/goyang/pkg/yang"
+	"github.com/openconfig/ygot/internal/yreflect"
 	"github.com/openconfig/ygot/util"
+	"github.com/openconfig/ygot/ygot"
 )
 
 // Refer to: https://tools.ietf.org/html/rfc6020#section-7.8.
@@ -42,40 +44,49 @@ func validateList(schema *yang.Entry, value interface{}) util.Errors {
 	util.DbgPrint("validateList with value %v, type %T, schema name %s", value, value, schema.Name)
 
 	kind := reflect.TypeOf(value).Kind()
-	if kind == reflect.Slice || kind == reflect.Map {
+	orderedMap, isOrderedMap := value.(ygot.GoOrderedMap)
+	if kind == reflect.Slice || kind == reflect.Map || isOrderedMap {
 		// Check list attributes: size constraints etc.
 		// Skip this check if not a list type - in this case value may be a list
 		// element which shares the list schema (excluding ListAttr).
 		errors = util.AppendErrs(errors, validateListAttr(schema, value))
 	}
 
-	switch kind {
-	case reflect.Slice:
+	checkMapElement := func(key, val reflect.Value) {
+		structElems := val.Elem()
+		// Check that keys are present and have correct values.
+		errors = util.AppendErrs(errors, checkKeys(schema, structElems, key))
+
+		// Verify each elements's fields.
+		errors = util.AppendErrs(errors, validateStructElems(schema, val.Interface()))
+	}
+
+	switch {
+	case isOrderedMap:
+		errors = util.AppendErr(errors, yreflect.RangeOrderedMap(orderedMap, func(k, v reflect.Value) bool {
+			checkMapElement(k, v)
+			return true
+		}))
+	case kind == reflect.Slice:
 		// List without key is a slice in the data tree.
 		sv := reflect.ValueOf(value)
 		for i := 0; i < sv.Len(); i++ {
 			errors = util.AppendErrs(errors, validateStructElems(schema, sv.Index(i).Interface()))
 		}
-	case reflect.Map:
+	case kind == reflect.Map:
 		// List with key is a map in the data tree, with the key being the value
 		// of the key field(s) in the elements.
 		for _, key := range reflect.ValueOf(value).MapKeys() {
-			cv := reflect.ValueOf(value).MapIndex(key).Interface()
-			structElems := reflect.ValueOf(cv).Elem()
-			// Check that keys are present and have correct values.
-			errors = util.AppendErrs(errors, checkKeys(schema, structElems, key))
-
-			// Verify each elements's fields.
-			errors = util.AppendErrs(errors, validateStructElems(schema, cv))
+			checkMapElement(key, reflect.ValueOf(value).MapIndex(key))
 		}
-	case reflect.Ptr:
+	case kind == reflect.Ptr:
 		// Validate was called on a list element rather than the whole list, or
 		// on a completely bogus struct. In either case, evaluate just the
 		// element against the list schema without considering list attributes.
 		errors = util.AppendErrs(errors, validateStructElems(schema, value))
 
 	default:
-		errors = util.AppendErr(errors, fmt.Errorf("validateList expected map/slice type for %s, got %T", schema.Name, value))
+		errors = util.AppendErr(errors, fmt.Errorf("validateList expected map/slice/GoOrderedMap type for %s, got %T", schema.Name, value))
 	}
 
 	return errors
@@ -83,15 +94,17 @@ func validateList(schema *yang.Entry, value interface{}) util.Errors {
 
 // checkKeys checks that the map key value for the list equals the value of the
 // key field(s) in the elements for the map value.
-//   entry is the schema for the list.
-//   structElems is the structure representing the element in the data tree.
-//   keyElems is the structure representing the map key in the data tree.
+//
+// - entry is the schema for the list.
+// - structElems is the structure representing the element in the data tree.
+// - keyElems is the structure representing the map key in the data tree.
+//
 // For a list schema that has a struct key, it's expected that:
-//    1. The schema contains leaves with the struct field names (checked before
-//       calling this function).
-//    2. Each element in the list has key fields defined by the leaves in 1.
-//    3. For each such key field, the field value in the element equals the
-//       value of the map key of the containing map in the data tree.
+//  1. The schema contains leaves with the struct field names (checked before
+//     calling this function).
+//  2. Each element in the list has key fields defined by the leaves in 1.
+//  3. For each such key field, the field value in the element equals the
+//     value of the map key of the containing map in the data tree.
 func checkKeys(schema *yang.Entry, structElems reflect.Value, keyValue reflect.Value) util.Errors {
 	keys := strings.Fields(schema.Key)
 	if len(keys) == 1 {
@@ -133,9 +146,9 @@ func checkBasicKeyValue(structElems reflect.Value, keyFieldSchemaName string, ke
 
 // checkStructKeyValues checks that the provided key struct (which is the key
 // value of the entry in the data tree map):
-//  - has all the fields defined in the schema key definition
-//  - has no fields not defined in the schema key definition
-//  - has values for each field equal to the corresponding field in the element.
+//   - has all the fields defined in the schema key definition
+//   - has no fields not defined in the schema key definition
+//   - has values for each field equal to the corresponding field in the element.
 func checkStructKeyValues(structElems reflect.Value, keyStruct reflect.Value) util.Errors {
 	var errors []error
 	if keyStruct.Type().Kind() != reflect.Struct {
@@ -202,8 +215,8 @@ func validateStructElems(schema *yang.Entry, value interface{}) util.Errors {
 	return errors
 }
 
-// validateListSchema validates the given list type schema. This is a sanity
-// check validation rather than a comprehensive validation against the RFC.
+// validateListSchema validates the given list type schema. This is a quick
+// check rather than a comprehensive validation against the RFC.
 // It is assumed that such a validation is done when the schema is parsed from
 // source YANG.
 func validateListSchema(schema *yang.Entry) error {
@@ -271,11 +284,12 @@ func nameMatchesPath(fieldName string, path []string) (bool, error) {
 
 // unmarshalList unmarshals a JSON array into a list parent, which must be a
 // map or slice ptr.
-//   schema is the schema of the schema node corresponding to the struct being
-//     unmamshaled into
-//   jsonList is a JSON list
-//   opts... are a set of ytypes.UnmarshalOptionst that are used to control
-//     the behaviour of the unmarshal function.
+//
+// - schema is the schema of the schema node corresponding to the struct being
+// unmamshaled into
+// - jsonList is a JSON list
+// - opts... are a set of ytypes.UnmarshalOptionst that are used to control
+// the behaviour of the unmarshal function.
 func unmarshalList(schema *yang.Entry, parent interface{}, jsonList interface{}, enc Encoding, opts ...UnmarshalOpt) error {
 	if util.IsValueNil(jsonList) {
 		return nil
@@ -290,10 +304,31 @@ func unmarshalList(schema *yang.Entry, parent interface{}, jsonList interface{},
 	// Parent must be a map, slice ptr, or struct ptr.
 	t := reflect.TypeOf(parent)
 
-	if util.IsTypeStructPtr(t) {
+	orderedMap, isOrderedMap := parent.(ygot.GoOrderedMap)
+
+	var listElementType reflect.Type
+	switch {
+	case !isOrderedMap && util.IsTypeStructPtr(t):
 		// May be trying to unmarshal a single list element rather than the
 		// whole list.
 		return unmarshalContainerWithListSchema(schema, parent, jsonList, opts...)
+	case !isOrderedMap:
+		if !(util.IsTypeMap(t) || util.IsTypeSlicePtr(t)) {
+			return fmt.Errorf("unmarshalList for %s got parent type %s, expect map, slice ptr or struct ptr", schema.Name, t.Kind())
+		}
+
+		listElementType = t.Elem()
+		if util.IsTypeSlicePtr(t) {
+			listElementType = t.Elem().Elem()
+		}
+		if !util.IsTypeStructPtr(listElementType) {
+			return fmt.Errorf("unmarshalList for %s parent type %T, has bad field type %v", listElementType, parent, listElementType)
+		}
+	default:
+		var err error
+		if listElementType, err = yreflect.OrderedMapElementType(orderedMap); err != nil {
+			return err
+		}
 	}
 
 	// jsonList represents a JSON array, which is a Go slice.
@@ -301,18 +336,6 @@ func unmarshalList(schema *yang.Entry, parent interface{}, jsonList interface{},
 	if !ok {
 		return fmt.Errorf("unmarshalList for schema %s: jsonList %v: got type %T, expect []interface{}",
 			schema.Name, util.ValueStr(jsonList), jsonList)
-	}
-
-	if !(util.IsTypeMap(t) || util.IsTypeSlicePtr(t)) {
-		return fmt.Errorf("unmarshalList for %s got parent type %s, expect map, slice ptr or struct ptr", schema.Name, t.Kind())
-	}
-
-	listElementType := t.Elem()
-	if util.IsTypeSlicePtr(t) {
-		listElementType = t.Elem().Elem()
-	}
-	if !util.IsTypeStructPtr(listElementType) {
-		return fmt.Errorf("unmarshalList for %s parent type %T, has bad field type %v", listElementType, parent, listElementType)
 	}
 
 	// Iterate over JSON list. Each JSON list element is a map with the field
@@ -333,13 +356,27 @@ func unmarshalList(schema *yang.Entry, parent interface{}, jsonList interface{},
 		}
 
 		switch {
+		case isOrderedMap:
+			err = yreflect.AppendIntoOrderedMap(orderedMap, newVal.Interface())
 		case util.IsTypeMap(t):
 			var newKey reflect.Value
 			newKey, err = makeKeyForInsert(schema, parent, newVal)
 			if err != nil {
 				return err
 			}
-			err = util.InsertIntoMap(parent, newKey.Interface(), newVal.Interface())
+			// First try to get the existing element.
+			// If it doesn't exist, then use the new one in order
+			// to have update, and not replace semantics.
+			val := reflect.ValueOf(parent).MapIndex(newKey)
+			if !val.IsValid() || val.IsZero() {
+				val = newVal
+			} else {
+				if err := unmarshalStruct(schema, val.Interface(), jt, enc, opts...); err != nil {
+					return err
+				}
+			}
+
+			err = util.InsertIntoMap(parent, newKey.Interface(), val.Interface())
 		case util.IsTypeSlicePtr(t):
 			err = util.InsertIntoSlice(parent, newVal.Interface())
 		default:
@@ -393,8 +430,28 @@ func makeValForInsert(schema *yang.Entry, parent interface{}, keys map[string]st
 		}
 		if keySchema.Type.Kind == yang.Yleafref {
 			leafrefPath := keySchema.Type.Path
-			if keySchema = keySchema.Find(leafrefPath); keySchema == nil {
-				return fmt.Errorf("cannot find leafref %q in schema directory %v", leafrefPath, schema.Dir)
+			switch {
+			case leafrefPath[0] == '/':
+				// If this is an absolute path, we need to implement this search without Find, since
+				// we do not have the complete goyang yang.Entry schema tree available to us. We know
+				// that we can use Find at any node other than the root, therefore we do the first
+				// resolution from the root ourselves, and then use Find to complete the rest of the
+				// path, which ensures that this is safe.
+				rootSch := keySchema
+				for ; rootSch.Parent != nil; rootSch = rootSch.Parent {
+				}
+				pv := util.SplitPath(leafrefPath)
+				v, ok := rootSch.Dir[util.StripModulePrefix(pv[1])]
+				if !ok {
+					return fmt.Errorf("cannot resolve leafref, %s (can't find top-level %s in %v at %s)", leafrefPath, util.StripModulePrefix(pv[1]), rootSch.Dir, rootSch.Name)
+				}
+				if keySchema = v.Find(strings.Join(pv[2:], "/")); keySchema == nil {
+					return fmt.Errorf("cannot find absolute leafref %s from %v", strings.Join(pv[2:], "/"), v.Name)
+				}
+			default:
+				if keySchema = keySchema.Find(leafrefPath); keySchema == nil {
+					return fmt.Errorf("cannot find leafref %q in schema directory %v", leafrefPath, schema.Dir)
+				}
 			}
 		}
 

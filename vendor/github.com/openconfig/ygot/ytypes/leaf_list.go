@@ -63,7 +63,7 @@ func validateLeafList(schema *yang.Entry, value interface{}) util.Errors {
 	return errors
 }
 
-// validateLeafListSchema validates the given list type schema. This is a sanity
+// validateLeafListSchema validates the given list type schema. This is a quick
 // check validation rather than a comprehensive validation against the RFC.
 // It is assumed that such a validation is done when the schema is parsed from
 // source YANG.
@@ -83,12 +83,13 @@ func validateLeafListSchema(schema *yang.Entry) error {
 }
 
 // unmarshalLeafList unmarshals given value into a Go slice parent.
-//   schema is the schema of the schema node corresponding to the field being
-//     unmamshaled into
-//   enc is the encoding type used to encode the value
-//   value is a JSON array if enc is JSONEncoding, represented as Go slice
-//   value is a gNMI TypedValue if enc is GNMIEncoding, represented as TypedValue_LeafListVal
-func unmarshalLeafList(schema *yang.Entry, parent interface{}, value interface{}, enc Encoding) error {
+//
+// - schema is the schema of the schema node corresponding to the field being
+// unmamshaled into
+// - enc is the encoding type used to encode the value
+// - value is a JSON array if enc is JSONEncoding, represented as Go slice
+// - value is a gNMI TypedValue if enc is GNMIEncoding, represented as TypedValue_LeafListVal
+func unmarshalLeafList(schema *yang.Entry, parent interface{}, value interface{}, enc Encoding, opts ...UnmarshalOpt) error {
 	if util.IsValueNil(value) {
 		if enc == JSONEncoding {
 			return nil
@@ -97,6 +98,11 @@ func unmarshalLeafList(schema *yang.Entry, parent interface{}, value interface{}
 	}
 	// Check that the schema itself is valid.
 	if err := validateLeafListSchema(schema); err != nil {
+		return err
+	}
+
+	fieldName, _, err := schemaToStructFieldName(schema, parent, hasPreferShadowPath(opts))
+	if err != nil {
 		return err
 	}
 
@@ -119,8 +125,10 @@ func unmarshalLeafList(schema *yang.Entry, parent interface{}, value interface{}
 		if len(sa.LeaflistVal.GetElement()) == 0 {
 			return fmt.Errorf("unmarshalLeafList for schema %s: value %v: got empty leaf list, expect non-empty leaf list", schema.Name, util.ValueStr(value))
 		}
+		// A new leaf-list update specifies the entire leaf-list, so we should clear its contents if it is non-nil.
+		clearSliceField(parent, fieldName)
 		for _, v := range sa.LeaflistVal.GetElement() {
-			if err := unmarshalGeneric(&leafSchema, parent, v, enc); err != nil {
+			if err := unmarshalGeneric(&leafSchema, parent, v, enc, opts...); err != nil {
 				return err
 			}
 		}
@@ -130,8 +138,10 @@ func unmarshalLeafList(schema *yang.Entry, parent interface{}, value interface{}
 			return fmt.Errorf("unmarshalLeafList for schema %s: value %v: got type %T, expect []interface{}", schema.Name, util.ValueStr(value), value)
 		}
 
+		// A new leaf-list update specifies the entire leaf-list, so we should clear its contents if it is non-nil.
+		clearSliceField(parent, fieldName)
 		for _, leaf := range leafList {
-			if err := unmarshalGeneric(&leafSchema, parent, leaf, enc); err != nil {
+			if err := unmarshalGeneric(&leafSchema, parent, leaf, enc, opts...); err != nil {
 				return err
 			}
 		}
@@ -139,5 +149,32 @@ func unmarshalLeafList(schema *yang.Entry, parent interface{}, value interface{}
 		return fmt.Errorf("unknown encoding %v", enc)
 	}
 
+	return nil
+}
+
+// clearSliceField sets updates a field called fieldName (which must exist, but may be
+// nil) in parentStruct, with value nil.
+func clearSliceField(parentStruct interface{}, fieldName string) error {
+	util.DbgPrint("clearSliceField field %s of parent type %T with value %v", fieldName, parentStruct)
+
+	if util.IsValueNil(parentStruct) {
+		return fmt.Errorf("parent is nil in clearSliceField for field %s", fieldName)
+	}
+
+	pt, pv := reflect.TypeOf(parentStruct), reflect.ValueOf(parentStruct)
+
+	if !util.IsTypeStructPtr(pt) {
+		return fmt.Errorf("parent type %T must be a struct ptr", parentStruct)
+	}
+	ft, ok := pt.Elem().FieldByName(fieldName)
+	if !ok {
+		return fmt.Errorf("parent type %T does not have a field name %s", parentStruct, fieldName)
+	}
+
+	if ft.Type.Kind() != reflect.Slice {
+		return fmt.Errorf("field %s of parent type %T must be Slice type (%v)", fieldName, parentStruct, ft.Type.Kind())
+	}
+
+	pv.Elem().FieldByName(fieldName).Set(reflect.Zero(ft.Type))
 	return nil
 }

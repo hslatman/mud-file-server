@@ -82,7 +82,7 @@ func PathToSchemaPath(path *gnmipb.Path) (string, error) {
 // PathToStrings takes a gNMI Path and provides its string representation. For example,
 // the path Path{Element: []string{"one", "two", "three"} is converted to the slice
 // ["one", "two", "three"] and returned. Both the pre-0.4.0 "element"-based paths, and the
-//  >0.4.0 paths based on "elem" are supported. In the case that post-0.4.0 paths are
+// >0.4.0 paths based on "elem" are supported. In the case that post-0.4.0 paths are
 // specified, keys that are specified in the path are concatenated onto the name of
 // the path element using the format [name=value]. If the path specifies both pre-
 // and post-0.4.0 paths, the pre-0.4.0 version is returned.
@@ -232,6 +232,16 @@ func StringToStructuredPath(path string) (*gnmipb.Path, error) {
 		})
 	}
 	return gpath, nil
+}
+
+// MustStringToPath calls StringToStructuredPath and panics on error.
+// It is intended for use in tests with hard-coded strings.
+func MustStringToPath(path string) *gnmipb.Path {
+	p, err := StringToStructuredPath(path)
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
 // extractKV extracts key value predicates from the input string in. It returns

@@ -15,6 +15,7 @@
 package ytypes
 
 import (
+	"errors"
 	"reflect"
 
 	"github.com/openconfig/goyang/pkg/yang"
@@ -24,7 +25,7 @@ import (
 // Schema specifies the common types that are part of a generated ygot schema, such that
 // it can be referenced and handled in calling application code.
 type Schema struct {
-	Root       ygot.ValidatedGoStruct // Root is the ValidatedGoStruct that acts as the root for a schema, it is nil if there is no generated fakeroot.
+	Root       ygot.GoStruct          // Root is the ygot.GoStruct that acts as the root for a schema, it is nil if there is no generated fakeroot.
 	SchemaTree map[string]*yang.Entry // SchemaTree is the extracted schematree for the generated schema.
 	Unmarshal  UnmarshalFunc          // Unmarshal is a function that can unmarshal RFC7951 JSON into the specified Root type.
 }
@@ -41,5 +42,13 @@ func (s *Schema) RootSchema() *yang.Entry {
 	return s.SchemaTree[reflect.TypeOf(s.Root).Elem().Name()]
 }
 
-// UnmarshalFunc defines a common signature for an RFC7951 to GoStruct unmarshalling function
+// Validate performs schema validation on the schema root.
+func (s *Schema) Validate(vopts ...ygot.ValidationOption) error {
+	if !s.IsValid() {
+		return errors.New("invalid schema: not fully populated")
+	}
+	return ygot.ValidateGoStruct(s.Root, vopts...)
+}
+
+// UnmarshalFunc defines a common signature for an RFC7951 to ygot.GoStruct unmarshalling function
 type UnmarshalFunc func([]byte, ygot.GoStruct, ...UnmarshalOpt) error

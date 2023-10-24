@@ -38,20 +38,92 @@ func SchemaPaths(f reflect.StructField) ([][]string, error) {
 	return out, nil
 }
 
+// ShadowSchemaPaths returns all the paths in the shadow-path tag. If the tag
+// doesn't exist, a nil slice is returned.
+func ShadowSchemaPaths(f reflect.StructField) [][]string {
+	var out [][]string
+	pathTag, ok := f.Tag.Lookup("shadow-path")
+	if !ok || pathTag == "" {
+		return nil
+	}
+
+	ps := strings.Split(pathTag, "|")
+	for _, p := range ps {
+		out = append(out, stripModulePrefixes(strings.Split(p, "/")))
+	}
+	return out
+}
+
 // RelativeSchemaPath returns a path to the schema for the struct field f.
 // Paths are embedded in the "path" struct tag and can be either simple:
-//   e.g. "path:a"
+//
+//	e.g. "path:a"
+//
 // or composite (if path compression is used) e.g.
-//   e.g. "path:config/a|a"
+//
+//	e.g. "path:config/a|a"
+//
 // In the latter case, this function returns {"config", "a"}, because only the
 // longer path exists in the data tree and we want the schema for that node.
 // This case is found in OpenConfig leaf-ref cases where the key of a list is a
 // leafref; the schema *yang.Entry for the field is given by
 // schema.Dir["config"].Dir["a"].
 func RelativeSchemaPath(f reflect.StructField) ([]string, error) {
-	pathTag, ok := f.Tag.Lookup("path")
-	if !ok || pathTag == "" {
-		return nil, fmt.Errorf("field %s did not specify a path", f.Name)
+	return relativeSchemaPath(f, false)
+}
+
+// RelativeSchemaPathPreferShadow returns a shadow path (if exists) or path to
+// the schema for the struct field f.
+//
+// Paths are embedded in the "shadow-path" and "path" struct tags and can be
+// either simple:
+//
+//	e.g. "path:a"
+//
+// or composite (if path compression is used) e.g.
+//
+//	e.g. "path:config/a|a"
+//
+// In the latter case, this function returns {"config", "a"}, because only the
+// longer path exists in the data tree and we want the schema for that node.
+// This case is found in OpenConfig leaf-ref cases where the key of a list is a
+// leafref; the schema *yang.Entry for the field is given by
+// schema.Dir["config"].Dir["a"].
+func RelativeSchemaPathPreferShadow(f reflect.StructField) ([]string, error) {
+	return relativeSchemaPath(f, true)
+}
+
+// relativeSchemaPath returns a path to the schema for the struct field f.
+// Paths are embedded in the "path" struct tag and can be either simple:
+//
+//	e.g. "path:a"
+//
+// or composite (if path compression is used) e.g.
+//
+//	e.g. "path:config/a|a"
+//
+// In the latter case, this function returns {"config", "a"}, because only the
+// longer path exists in the data tree and we want the schema for that node.
+// This case is found in OpenConfig leaf-ref cases where the key of a list is a
+// leafref; the schema *yang.Entry for the field is given by
+// schema.Dir["config"].Dir["a"].
+//
+// If preferShadowPath is false, the path values from the "path" tag are used.
+// If preferShadowPath is true and the field has a "shadow-path" tag, then the
+// path values from the "shadow-path" tag are used; if the field doesn't have
+// the "shadow-path" tag, then the path values from the "path" tag are used.
+func relativeSchemaPath(f reflect.StructField, preferShadowPath bool) ([]string, error) {
+	var pathTag string
+	var ok bool
+	if preferShadowPath {
+		pathTag, ok = f.Tag.Lookup("shadow-path")
+	}
+	if !ok {
+		if pathTag, ok = f.Tag.Lookup("path"); !ok || pathTag == "" {
+			return nil, fmt.Errorf("field %s did not specify a path", f.Name)
+		}
+	} else if pathTag == "" {
+		return nil, fmt.Errorf("field %s did not specify a shadow-path", f.Name)
 	}
 
 	paths := strings.Split(pathTag, "|")
@@ -88,16 +160,26 @@ func SchemaTreePathNoModule(e *yang.Entry) string {
 // its path, expressed as a slice of strings, which is returned.
 func SchemaPathNoChoiceCase(elem *yang.Entry) []string {
 	var pp []string
+	for _, e := range SchemaEntryPathNoChoiceCase(elem) {
+		pp = append(pp, e.Name)
+	}
+	return pp
+}
+
+// SchemaEntryPathNoChoiceCase takes an input yang.Entry and walks up the tree to find
+// its path, expressed as a slice of Entrys, which is returned.
+func SchemaEntryPathNoChoiceCase(elem *yang.Entry) []*yang.Entry {
+	var pp []*yang.Entry
 	if elem == nil {
 		return pp
 	}
 	e := elem
 	for ; e.Parent != nil; e = e.Parent {
 		if !IsChoiceOrCase(e) {
-			pp = append(pp, e.Name)
+			pp = append(pp, e)
 		}
 	}
-	pp = append(pp, e.Name)
+	pp = append(pp, e)
 
 	// Reverse the slice that was specified to us as it was appended to
 	// from the leaf to the root.
@@ -174,10 +256,10 @@ func removeXPATHPredicates(s string) (string, error) {
 // FindLeafRefSchema returns a schema Entry at the path pathStr relative to
 // schema if it exists, or an error otherwise.
 // pathStr has either:
-//  - the relative form "../a/b/../b/c", where ".." indicates the parent of the
-//    node, or
-//  - the absolute form "/a/b/c", which indicates the absolute path from the
-//    root of the schema tree.
+//   - the relative form "../a/b/../b/c", where ".." indicates the parent of the
+//     node, or
+//   - the absolute form "/a/b/c", which indicates the absolute path from the
+//     root of the schema tree.
 func FindLeafRefSchema(schema *yang.Entry, pathStr string) (*yang.Entry, error) {
 	if pathStr == "" {
 		return nil, fmt.Errorf("leafref schema %s has empty path", schema.Name)
@@ -192,7 +274,7 @@ func FindLeafRefSchema(schema *yang.Entry, pathStr string) (*yang.Entry, error) 
 
 	// For absolute path, reset to root of the schema tree.
 	if pathStr[0] == '/' {
-		refSchema = SchemaTreeRoot(schema)
+		refSchema = TopLevelModule(schema)
 		path = path[1:]
 	}
 
@@ -206,13 +288,18 @@ func FindLeafRefSchema(schema *yang.Entry, pathStr string) (*yang.Entry, error) 
 			if refSchema.Parent == nil {
 				return nil, fmt.Errorf("parent of %s is nil for leafref schema %s with path %s", refSchema.Name, schema.Name, pathStr)
 			}
-			refSchema = refSchema.Parent
+			for refSchema = refSchema.Parent; IsChoiceOrCase(refSchema); refSchema = refSchema.Parent {
+			}
 			continue
 		}
-		if refSchema.Dir[pe] == nil {
+		entries, err := findFirstNonChoiceOrCaseEntry(refSchema)
+		if err != nil {
+			return nil, err
+		}
+		if entries[pe] == nil {
 			return nil, fmt.Errorf("schema node %s is nil for leafref schema %s with path %s", pe, schema.Name, pathStr)
 		}
-		refSchema = refSchema.Dir[pe]
+		refSchema = entries[pe]
 	}
 
 	return refSchema, nil

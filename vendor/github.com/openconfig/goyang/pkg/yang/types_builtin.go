@@ -28,438 +28,6 @@ import (
 
 // This file handles interpretation of types
 
-// TypeKind is the enumeration of the base types available in YANG.  It
-// is analogous to reflect.Kind.
-type TypeKind uint
-
-const (
-	// Ynone represents the invalid (unset) type.
-	Ynone = TypeKind(iota)
-	// Yint8 is an int in the range [-128, 127].
-	Yint8
-	// Yint16 is an int in the range [-32768, 32767].
-	Yint16
-	// Yint32 is an int in the range [-2147483648, 2147483647].
-	Yint32
-	// Yint64 is an int in the range [-9223372036854775808, 9223372036854775807]
-	Yint64
-	// Yuint8 is an int in the range [0, 255]
-	Yuint8
-	// Yuint16 is an int in the range [0, 65535]
-	Yuint16
-	// Yuint32 is an int in the range [0, 4294967295]
-	Yuint32
-	// Yuint64 is an int in the range [0, 18446744073709551615]
-	Yuint64
-
-	// Ybinary stores arbitrary data.
-	Ybinary
-	// Ybits is a named set of bits or flags.
-	Ybits
-	// Ybool is true or false.
-	Ybool
-	// Ydecimal64 is a signed decimal number.
-	Ydecimal64
-	// Yempty has no associated value.
-	Yempty
-	// Yenum stores enumerated strings.
-	Yenum
-	// Yidentityref stores an extensible enumeration.
-	Yidentityref
-	// YinstanceIdentifier stores a reference to a data tree node.
-	YinstanceIdentifier
-	// Yleafref stores a reference to a leaf instance.
-	Yleafref
-	// Ystring is a human readable string.
-	Ystring
-	// Yunion is a choice of types.
-	Yunion
-)
-
-// TypeKindFromName maps the string name used in a YANG file to the enumerated
-// TypeKind used in this library.
-var TypeKindFromName = map[string]TypeKind{
-	"none":                Ynone,
-	"int8":                Yint8,
-	"int16":               Yint16,
-	"int32":               Yint32,
-	"int64":               Yint64,
-	"uint8":               Yuint8,
-	"uint16":              Yuint16,
-	"uint32":              Yuint32,
-	"uint64":              Yuint64,
-	"binary":              Ybinary,
-	"bits":                Ybits,
-	"boolean":             Ybool,
-	"decimal64":           Ydecimal64,
-	"empty":               Yempty,
-	"enumeration":         Yenum,
-	"identityref":         Yidentityref,
-	"instance-identifier": YinstanceIdentifier,
-	"leafref":             Yleafref,
-	"string":              Ystring,
-	"union":               Yunion,
-}
-
-// TypeKindToName maps the enumerated type used in this library to the string
-// used in a YANG file.
-var TypeKindToName = map[TypeKind]string{
-	Ynone:               "none",
-	Yint8:               "int8",
-	Yint16:              "int16",
-	Yint32:              "int32",
-	Yint64:              "int64",
-	Yuint8:              "uint8",
-	Yuint16:             "uint16",
-	Yuint32:             "uint32",
-	Yuint64:             "uint64",
-	Ybinary:             "binary",
-	Ybits:               "bits",
-	Ybool:               "boolean",
-	Ydecimal64:          "decimal64",
-	Yempty:              "empty",
-	Yenum:               "enumeration",
-	Yidentityref:        "identityref",
-	YinstanceIdentifier: "instance-identifier",
-	Yleafref:            "leafref",
-	Ystring:             "string",
-	Yunion:              "union",
-}
-
-func (k TypeKind) String() string {
-	if s := TypeKindToName[k]; s != "" {
-		return s
-	}
-	return fmt.Sprintf("unknown-type-%d", k)
-}
-
-// A EnumType represents a mapping of strings to integers.  It is used both
-// for enumerations as well as bitfields.
-type EnumType struct {
-	last     int64 // maximum value assigned thus far
-	min      int64 // minimum value allowed
-	max      int64 // maximum value allowed
-	unique   bool  // numeric values must be unique (enums)
-	toString map[int64]string
-	toInt    map[string]int64
-}
-
-// NewEnumType returns an initialized EnumType.
-func NewEnumType() *EnumType {
-	return &EnumType{
-		last:     -1, // +1 will start at 0
-		min:      MinEnum,
-		max:      MaxEnum,
-		unique:   true,
-		toString: map[int64]string{},
-		toInt:    map[string]int64{},
-	}
-}
-
-// NewBitfield returns an EnumType initialized as a bitfield.  Multiple string
-// values may map to the same numeric values.  Numeric values must be small
-// non-negative integers.
-func NewBitfield() *EnumType {
-	return &EnumType{
-		last:     -1, // +1 will start at 0
-		min:      0,
-		max:      MaxBitfieldSize - 1,
-		toString: map[int64]string{},
-		toInt:    map[string]int64{},
-	}
-}
-
-// Set sets name in e to the provided value.  Set returns an error if the value
-// is invalid, name is already signed, or when used as an enum rather than a
-// bitfield, the value has previousl been used.  When two different names are
-// assigned to the same value, the conversion from value to name will result in
-// the most recently assigned name.
-func (e *EnumType) Set(name string, value int64) error {
-	if _, ok := e.toInt[name]; ok {
-		return fmt.Errorf("field %s already assigned", name)
-	}
-	if oname, ok := e.toString[value]; e.unique && ok {
-		return fmt.Errorf("fields %s and %s conflict on value %d", name, oname, value)
-	}
-	if value < e.min {
-		return fmt.Errorf("value %d for %s too small (minimum is %d)", value, name, e.min)
-	}
-	if value > e.max {
-		return fmt.Errorf("value %d for %s too large (maximum is %d)", value, name, e.max)
-	}
-	e.toString[value] = name
-	e.toInt[name] = value
-	if value >= e.last {
-		e.last = value
-	}
-	return nil
-}
-
-// SetNext sets the name in e using the next possible value that is greater than
-// all previous values.
-func (e *EnumType) SetNext(name string) error {
-	if e.last == MaxEnum {
-		return fmt.Errorf("enum must specify value")
-	}
-	return e.Set(name, e.last+1)
-}
-
-// Name returns the name in e associated with value.  The empty string is
-// returned if no name has been assigned to value.
-func (e *EnumType) Name(value int64) string { return e.toString[value] }
-
-// Value returns the value associated with name in e associated.  0 is returned
-// if name is not in e, or if it is the first value in an unnumbered enum. Use
-// IsDefined to definitively confirm name is in e.
-func (e *EnumType) Value(name string) int64 { return e.toInt[name] }
-
-// IsDefined returns true if name is defined in e, else false.
-func (e *EnumType) IsDefined(name string) bool {
-	_, defined := e.toInt[name]
-	return defined
-}
-
-// Names returns the sorted list of enum string names.
-func (e *EnumType) Names() []string {
-	names := make([]string, len(e.toInt))
-	i := 0
-	for name := range e.toInt {
-		names[i] = name
-		i++
-	}
-	sort.Strings(names)
-	return names
-}
-
-type int64Slice []int64
-
-func (p int64Slice) Len() int           { return len(p) }
-func (p int64Slice) Less(i, j int) bool { return p[i] < p[j] }
-func (p int64Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
-
-// Values returns the sorted list of enum values.
-func (e *EnumType) Values() []int64 {
-	values := make([]int64, len(e.toInt))
-	i := 0
-	for _, value := range e.toInt {
-		values[i] = value
-		i++
-	}
-	sort.Sort(int64Slice(values))
-	return values
-}
-
-// NameMap returns a map of names to values.
-func (e *EnumType) NameMap() map[string]int64 {
-	m := make(map[string]int64, len(e.toInt))
-	for name, value := range e.toInt {
-		m[name] = value
-	}
-	return m
-}
-
-// ValueMap returns a map of values to names.
-func (e *EnumType) ValueMap() map[int64]string {
-	m := make(map[int64]string, len(e.toString))
-	for name, value := range e.toString {
-		m[name] = value
-	}
-	return m
-}
-
-// A YangType is the internal representation of a type in YANG.  It may
-// refer to either a builtin type or type specified with typedef.  Not
-// all fields in YangType are used for all types.
-type YangType struct {
-	Name             string
-	Kind             TypeKind    // Ynone if not a base type
-	Base             *Type       `json:"-"`          // Base type for non-builtin types
-	IdentityBase     *Identity   `json:",omitempty"` // Base statement for a type using identityref
-	Root             *YangType   `json:"-"`          // root of this type that is the same
-	Bit              *EnumType   `json:",omitempty"` // bit position, "status" is lost
-	Enum             *EnumType   `json:",omitempty"` // enum name to value, "status" is lost
-	Units            string      `json:",omitempty"` // units to be used for this type
-	Default          string      `json:",omitempty"` // default value, if any
-	FractionDigits   int         `json:",omitempty"` // decimal64 fixed point precision
-	Length           YangRange   `json:",omitempty"` // this should be processed by section 12
-	OptionalInstance bool        `json:",omitempty"` // !require-instances which defaults to true
-	Path             string      `json:",omitempty"` // the path in a leafref
-	Pattern          []string    `json:",omitempty"` // limiting XSD-TYPES expressions on strings
-	POSIXPattern     []string    `json:",omitempty"` // limiting POSIX ERE on strings (specified by openconfig-extensions:posix-pattern)
-	Range            YangRange   `json:",omitempty"` // range for integers
-	Type             []*YangType `json:",omitempty"` // for unions
-}
-
-// BaseTypedefs is a map of all base types to the Typedef structure manufactured
-// for the type.
-var BaseTypedefs = map[string]*Typedef{}
-
-// typedef returns a Typedef created from y for insertion into the BaseTypedefs
-// map.
-func (y *YangType) typedef() *Typedef {
-	return &Typedef{
-		Name:   y.Name,
-		Source: &Statement{},
-		Type: &Type{
-			Name:     y.Name,
-			Source:   &Statement{},
-			YangType: y,
-		},
-		YangType: y,
-	}
-}
-
-// ssEqual returns true if the two slices are equivalent.
-func ssEqual(s1, s2 []string) bool {
-	if len(s1) != len(s2) {
-		return false
-	}
-	for x, s := range s1 {
-		if s != s2[x] {
-			return false
-		}
-	}
-	return true
-}
-
-// tsEqual returns true if the two Type slices are identical.
-func tsEqual(t1, t2 []*YangType) bool {
-	if len(t1) != len(t2) {
-		return false
-	}
-	// For now we compare absolute pointers.
-	// This may be wrong.
-	for x, t := range t1 {
-		if !t.Equal(t2[x]) {
-			return false
-		}
-	}
-	return true
-}
-
-// Equal returns true if y and t describe the same type.
-func (y *YangType) Equal(t *YangType) bool {
-	switch {
-	case
-		// Don't check the Name, it contains no information
-		y.Kind != t.Kind,
-		y.Units != t.Units,
-		y.Default != t.Default,
-		y.FractionDigits != t.FractionDigits,
-		y.IdentityBase != t.IdentityBase,
-		len(y.Length) != len(t.Length),
-		!y.Length.Equal(t.Length),
-		y.OptionalInstance != t.OptionalInstance,
-		y.Path != t.Path,
-		!ssEqual(y.Pattern, t.Pattern),
-		len(y.Range) != len(t.Range),
-		!y.Range.Equal(t.Range),
-		!tsEqual(y.Type, t.Type):
-
-		return false
-	}
-	// TODO(borman): Base, Bit, Enum
-	return true
-}
-
-// Install builtin types as know types
-func init() {
-	for k, v := range baseTypes {
-		// Base types are always their own root
-		v.Root = v
-		BaseTypedefs[k] = v.typedef()
-	}
-}
-
-var baseTypes = map[string]*YangType{
-	"int8": {
-		Name:  "int8",
-		Kind:  Yint8,
-		Range: Int8Range,
-	},
-	"int16": {
-		Name:  "int16",
-		Kind:  Yint16,
-		Range: Int16Range,
-	},
-	"int32": {
-		Name:  "int32",
-		Kind:  Yint32,
-		Range: Int32Range,
-	},
-	"int64": {
-		Name:  "int64",
-		Kind:  Yint64,
-		Range: Int64Range,
-	},
-	"uint8": {
-		Name:  "uint8",
-		Kind:  Yuint8,
-		Range: Uint8Range,
-	},
-	"uint16": {
-		Name:  "uint16",
-		Kind:  Yuint16,
-		Range: Uint16Range,
-	},
-	"uint32": {
-		Name:  "uint32",
-		Kind:  Yuint32,
-		Range: Uint32Range,
-	},
-	"uint64": {
-		Name:  "uint64",
-		Kind:  Yuint64,
-		Range: Uint64Range,
-	},
-
-	"decimal64": {
-		Name:  "decimal64",
-		Kind:  Ydecimal64,
-		Range: Decimal64Range,
-	},
-	"string": {
-		Name: "string",
-		Kind: Ystring,
-	},
-	"boolean": {
-		Name: "boolean",
-		Kind: Ybool,
-	},
-	"enumeration": {
-		Name: "enumeration",
-		Kind: Yenum,
-	},
-	"bits": {
-		Name: "bits",
-		Kind: Ybits,
-	},
-	"binary": {
-		Name: "binary",
-		Kind: Ybinary,
-	},
-	"leafref": {
-		Name: "leafref",
-		Kind: Yleafref,
-	},
-	"identityref": {
-		Name: "identityref",
-		Kind: Yidentityref,
-	},
-	"empty": {
-		Name: "empty",
-		Kind: Yempty,
-	},
-	"union": {
-		Name: "union",
-		Kind: Yunion,
-	},
-	"instance-identifier": {
-		Name: "instance-identifier",
-		Kind: YinstanceIdentifier,
-	},
-}
-
 // These are the default ranges defined by the YANG standard.
 var (
 	Int8Range  = mustParseRangesInt("-128..127")
@@ -471,8 +39,6 @@ var (
 	Uint16Range = mustParseRangesInt("0..65535")
 	Uint32Range = mustParseRangesInt("0..4294967295")
 	Uint64Range = mustParseRangesInt("0..18446744073709551615")
-
-	Decimal64Range = mustParseRangesDecimal("min..max", 1)
 )
 
 const (
@@ -480,6 +46,9 @@ const (
 	MaxInt64 = 1<<63 - 1
 	// MinInt64 corresponds to the maximum value of a signed int64.
 	MinInt64 = -1 << 63
+	// Min/MaxDecimal64 are the max/min decimal64 values.
+	MinDecimal64 float64 = -922337203685477580.8
+	MaxDecimal64 float64 = 922337203685477580.7
 	// AbsMinInt64 is the absolute value of MinInt64.
 	AbsMinInt64 = 1 << 63
 	// MaxEnum is the maximum value of an enumeration.
@@ -490,186 +59,33 @@ const (
 	MaxBitfieldSize = 1 << 32
 	// MaxFractionDigits is the maximum number of fractional digits as per RFC6020 Section 9.3.4.
 	MaxFractionDigits uint8 = 18
+
+	space18 = "000000000000000000" // used for prepending 0's
 )
-
-type NumberKind int
-
-const (
-	// Positive indicates that a Number is non-negative.
-	Positive = NumberKind(iota)
-	// Negative indicates that a Number is negative.
-	Negative
-	// MinNumber indicates that the Number is the minimum value allowed for the range.
-	MinNumber
-	// MaxNumber indicates that the Number is the maximum value allowed for the range.
-	MaxNumber
-)
-
-const space18 = "000000000000000000" // used for prepending 0's
 
 // A Number is either an integer the range of [-(1<<64) - 1, (1<<64)-1], or a
 // YANG decimal conforming to https://tools.ietf.org/html/rfc6020#section-9.3.4.
 type Number struct {
-	// Kind is the kind of number (+/-ve, min/max).
-	Kind NumberKind
 	// Absolute value of the number.
 	Value uint64
 	// Number of fractional digits.
+	// 0 means it's an integer. For decimal64 it falls within [1, 18].
 	FractionDigits uint8
+	// Negative indicates whether the number is negative.
+	Negative bool
 }
-
-var maxNumber = Number{Kind: MaxNumber}
-var minNumber = Number{Kind: MinNumber}
 
 // IsDecimal reports whether n is a decimal number.
 func (n Number) IsDecimal() bool {
 	return n.FractionDigits != 0
 }
 
-// FromInt creates a Number from an int64.
-func FromInt(i int64) Number {
-	if i < 0 {
-		return Number{Kind: Negative, Value: uint64(-i)}
-	}
-	return Number{Kind: Positive, Value: uint64(i)}
-}
-
-// FromUint creates a Number from a uint64.
-func FromUint(i uint64) Number {
-	return Number{Kind: Positive, Value: i}
-}
-
-// FromFloat creates a Number from a float64. Input values with absolute value
-// larger than MaxInt64/MinInt64 are converted into maxNumber/minNumber.
-func FromFloat(f float64) Number {
-	if f > float64(MaxInt64) {
-		return maxNumber
-	}
-	if f < float64(MinInt64) {
-		return minNumber
-	}
-
-	// Per RFC7950/6020, fraction-digits must be at least 1.
-	fracDig := uint8(1)
-	f *= 10.0
-	for ; Frac(f) != 0.0 && fracDig <= MaxFractionDigits; fracDig++ {
-		f *= 10.0
-	}
-	v := uint64(f)
-	kind := Positive
-	if f < 0 {
-		kind = Negative
-		v = -v
-	}
-
-	n := Number{Kind: kind, Value: v, FractionDigits: fracDig}
-
-	return n
-}
-
-// ParseInt returns s as a Number with FractionDigits=0.
-// octal, or hexadecimal using the standard prefix notations (e.g., 0 and 0x)
-func ParseInt(s string) (Number, error) {
-	s = strings.TrimSpace(s)
-	var n Number
-	switch s {
-	case "max":
-		return maxNumber, nil
-	case "min":
-		return minNumber, nil
-	case "":
-		return n, errors.New("converting empty string to number")
-	case "+", "-":
-		return n, errors.New("sign with no value")
-	}
-
-	n.Kind = Positive
-	ns := s
-	switch s[0] {
-	case '+':
-		ns = s[1:]
-	case '-':
-		n.Kind = Negative
-		ns = s[1:]
-	}
-
-	var err error
-	n.Value, err = strconv.ParseUint(ns, 0, 64)
-	return n, err
-}
-
-// ParseDecimal returns s as a Number with a non-zero FractionDigits.
-// octal, or hexadecimal using the standard prefix notations (e.g., 0 and 0x)
-func ParseDecimal(s string, fracDigRequired uint8) (n Number, err error) {
-	s = strings.TrimSpace(s)
-	switch s {
-	case "max":
-		return maxNumber, nil
-	case "min":
-		return minNumber, nil
-	case "":
-		return n, errors.New("converting empty string to number")
-	case "+", "-":
-		return n, errors.New("sign with no value")
-	}
-
-	return decimalValueFromString(s, fracDigRequired)
-}
-
-// decimalValueFromString returns a decimal Number representation of numStr.
-// fracDigRequired is used to set the number of fractional digits, which must
-// be at least the greatest precision seen in numStr.
-// which must be between 1 and 18.
-// numStr must conform to Section 9.3.4.
-func decimalValueFromString(numStr string, fracDigRequired uint8) (n Number, err error) {
-	if fracDigRequired > MaxFractionDigits || fracDigRequired < 1 {
-		return n, fmt.Errorf("invalid number of fraction digits %d > max of %d, minimum 1", fracDigRequired, MaxFractionDigits)
-	}
-
-	s := numStr
-	dx := strings.Index(s, ".")
-	var fracDig uint8
-	if dx >= 0 {
-		fracDig = uint8(len(s) - 1 - dx)
-		// remove first decimal, if dx > 1, will fail ParseInt below
-		s = s[:dx] + s[dx+1:]
-	}
-
-	if fracDig > fracDigRequired {
-		return n, fmt.Errorf("%s has too much precision, expect <= %d fractional digits", s, fracDigRequired)
-	}
-
-	s += space18[:fracDigRequired-fracDig]
-
-	v, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return n, fmt.Errorf("%s is not a valid decimal number: %s", numStr, err)
-	}
-
-	kind := Positive
-	if v < 0 {
-		kind = Negative
-		v = -v
-	}
-
-	return Number{Kind: kind, Value: uint64(v), FractionDigits: fracDigRequired}, nil
-}
-
 // String returns n as a string in decimal.
 func (n Number) String() string {
-	var out string
-	switch n.Kind {
-	case MinNumber:
-		return "min"
-	case MaxNumber:
-		return "max"
-	}
-
-	out += strconv.FormatUint(n.Value, 10)
+	out := strconv.FormatUint(n.Value, 10)
 
 	if n.IsDecimal() {
-		fd := int(n.FractionDigits)
-		if fd > 0 {
+		if fd := int(n.FractionDigits); fd > 0 {
 			ofd := len(out) - fd
 			if ofd <= 0 {
 				// We want 0.1 not .1
@@ -679,60 +95,40 @@ func (n Number) String() string {
 			out = out[:ofd] + "." + out[ofd:]
 		}
 	}
-	if n.Kind == Negative {
+	if n.Negative {
 		out = "-" + out
 	}
 
 	return out
 }
 
-// Int returns n as an int64.  It returns an error if n overflows an int64 or
+// Int returns n as an int64. It returns an error if n overflows an int64 or
 // the number is decimal.
 func (n Number) Int() (int64, error) {
-	nv := n.Value
 	if n.IsDecimal() {
-		nv = n.Value / uint64(math.Pow10(int(n.FractionDigits)))
+		return 0, errors.New("called Int() on decimal64 value")
 	}
-	switch n.Kind {
-	case MinNumber:
-		return MinInt64, nil
-	case MaxNumber:
-		return MaxInt64, nil
-	case Negative:
-		switch {
-		case nv == AbsMinInt64:
-			return MinInt64, nil
-		case nv < AbsMinInt64:
-			return -int64(nv), nil
-		}
-	case Positive:
-		if n.Value <= MaxInt64 {
-			return int64(nv), nil
-		}
-		return 0, errors.New("signed integer overflow")
-	default:
+	if n.Negative {
+		return -int64(n.Value), nil
 	}
-	return 0, errors.New("unknown number type")
+	if n.Value <= MaxInt64 {
+		return int64(n.Value), nil
+	}
+	return 0, errors.New("signed integer overflow")
 }
 
 // addQuantum adds the smallest quantum to n without checking overflow.
 func (n Number) addQuantum(i uint64) Number {
-	switch n.Kind {
-	case MinNumber:
-		return n
-	case MaxNumber:
-		return n
-	case Negative:
+	switch n.Negative {
+	case true:
 		if n.Value <= i {
 			n.Value = i - n.Value
-			n.Kind = Positive
+			n.Negative = false
 		} else {
 			n.Value -= i
 		}
-	case Positive:
+	case false:
 		n.Value += i
-	default:
-		panic("add to unknown number type")
 	}
 	return n
 }
@@ -741,17 +137,9 @@ func (n Number) addQuantum(i uint64) Number {
 // and decimal.
 func (n Number) Less(m Number) bool {
 	switch {
-	case m.Kind == MinNumber:
-		return false
-	case n.Kind == MinNumber:
+	case n.Negative && !m.Negative:
 		return true
-	case n.Kind == MaxNumber:
-		return false
-	case m.Kind == MaxNumber:
-		return true
-	case n.Kind == Negative && m.Kind != Negative:
-		return true
-	case n.Kind != Negative && m.Kind == Negative:
+	case !n.Negative && m.Negative:
 		return false
 	}
 
@@ -765,7 +153,7 @@ func (n Number) Less(m Number) bool {
 		lt = nf < mf
 	}
 
-	if n.Kind == Negative {
+	if n.Negative {
 		return !lt
 	}
 	return lt
@@ -802,117 +190,6 @@ func (r YRange) Valid() bool {
 	return !r.Max.Less(r.Min)
 }
 
-// A YangRange is a set of non-overlapping ranges.
-type YangRange []YRange
-
-// ParseRangesInt parses s into a series of ranges. Each individual range is in s
-// is separated by the pipe character (|).  The min and max value of a range
-// are separated by "..".  An error is returned if the range is invalid. The
-// output range is sorted and coalesced.
-func ParseRangesInt(s string) (YangRange, error) {
-	return parseRanges(s, false, 0)
-}
-
-// ParseRangesDecimal parses s into a series of ranges. Each individual range is in s
-// is separated by the pipe character (|).  The min and max value of a range
-// are separated by "..".  An error is returned if the range is invalid. The
-// output range is sorted and coalesced.
-func ParseRangesDecimal(s string, fracDigRequired uint8) (YangRange, error) {
-	return parseRanges(s, true, fracDigRequired)
-}
-
-// parseRanges parses s into a series of ranges. Each individual range is in s
-// is separated by the pipe character (|).  The min and max value of a range
-// are separated by "..".  An error is returned if the range is invalid. The
-// output range is sorted and coalesced. fracDigRequired is ignored when
-// decimal=false.
-func parseRanges(s string, decimal bool, fracDigRequired uint8) (YangRange, error) {
-	parseNumber := func(s string) (Number, error) {
-		if decimal {
-			return ParseDecimal(s, fracDigRequired)
-		} else {
-			return ParseInt(s)
-		}
-	}
-
-	parts := strings.Split(s, "|")
-	r := make(YangRange, len(parts))
-	for i, s := range parts {
-		parts := strings.Split(s, "..")
-		min, err := parseNumber(parts[0])
-		if err != nil {
-			return nil, err
-		}
-		var max Number
-		switch len(parts) {
-		case 1:
-			max = min
-		case 2:
-			max, err = parseNumber(parts[1])
-			if err != nil {
-				return nil, err
-			}
-		default:
-			return nil, fmt.Errorf("too many '..' in %s", s)
-		}
-		if max.Less(min) {
-			return nil, fmt.Errorf("range boundaries out of order (%s less than %s): %s", max, min, s)
-		}
-		r[i] = YRange{min, max}
-	}
-	r.Sort()
-	r = coalesce(r)
-
-	if err := r.Validate(); err != nil {
-		return nil, err
-	}
-	return r, nil
-}
-
-// coalesce coalesces r into as few ranges as possible.  For example,
-// 1..5|6..10 would become 1..10.  r is assumed to be sorted.
-func coalesce(r YangRange) YangRange {
-	// coalesce the ranges if we have more than 1.
-	if len(r) < 2 {
-		return r
-	}
-	cr := make(YangRange, len(r))
-	i := 0
-	cr[i] = r[0]
-	for _, r1 := range r[1:] {
-		// r1.Min is always at least as large as cr[i].Min
-		// Cases are:
-		// r1 is contained in cr[i]
-		// r1 starts inside of cr[i]
-		// r1.Min cr[i].Max+1
-		// r1 is beyond cr[i]
-		if cr[i].Max.addQuantum(1).Less(r1.Min) {
-			// r1 starts after cr[i], this is a new range
-			i++
-			cr[i] = r1
-		} else if cr[i].Max.Less(r1.Max) {
-			cr[i].Max = r1.Max
-		}
-	}
-	return cr[:i+1]
-}
-
-func mustParseRangesInt(s string) YangRange {
-	r, err := ParseRangesInt(s)
-	if err != nil {
-		panic(err)
-	}
-	return r
-}
-
-func mustParseRangesDecimal(s string, fracDigRequired uint8) YangRange {
-	r, err := ParseRangesDecimal(s, fracDigRequired)
-	if err != nil {
-		panic(err)
-	}
-	return r
-}
-
 // String returns r as a string using YANG notation, either a simple
 // value if min == max or min..max.
 func (r YRange) String() string {
@@ -921,6 +198,14 @@ func (r YRange) String() string {
 	}
 	return r.Min.String() + ".." + r.Max.String()
 }
+
+// Equal compares whether two YRanges are equal.
+func (r YRange) Equal(s YRange) bool {
+	return r.Min.Equal(s.Min) && r.Max.Equal(s.Max)
+}
+
+// A YangRange is a set of non-overlapping ranges.
+type YangRange []YRange
 
 // String returns the ranges r using YANG notation.  Individual ranges
 // are separated by pipes (|).
@@ -980,7 +265,7 @@ func (r YangRange) Equal(q YangRange) bool {
 		return false
 	}
 	for i, r := range r {
-		if r != q[i] {
+		if !r.Equal(q[i]) {
 			return false
 		}
 	}
@@ -988,14 +273,10 @@ func (r YangRange) Equal(q YangRange) bool {
 }
 
 // Contains returns true if all possible values in s are also possible values
-// in r.  An empty range is assumed to be min..max.
-// TODO(wenbli): The current behaviour of this is confusing and unexplained by
-// comments: why does the presence of min/max always cause the range to be
-// considered as contained? Should test on current schema, and if there are no
-// problems, change it to its natural definition.
+// in r. An empty range is assumed to be min..max when it is the receiver
+// argument.
 func (r YangRange) Contains(s YangRange) bool {
-	// No range means allow everything in range for the type.
-	if len(s) == 0 || len(r) == 0 {
+	if len(r) == 0 || len(s) == 0 {
 		return true
 	}
 
@@ -1003,23 +284,271 @@ func (r YangRange) Contains(s YangRange) bool {
 	// Both range lists should be in order and non-adjacent (coalesced).
 	ri := 0
 	for _, ss := range s {
-		// min is always within range
-		if ss.Min.Kind != MinNumber {
-			for r[ri].Max.Less(ss.Min) {
-				ri += 1
-				if ri == len(r) {
-					return false
-				}
+		for r[ri].Max.Less(ss.Min) {
+			ri++
+			if ri == len(r) {
+				return false
 			}
-		}
-		if (ss.Max.Kind == MaxNumber) || (ss.Min.Kind == MinNumber) {
-			continue
 		}
 		if ss.Min.Less(r[ri].Min) || r[ri].Max.Less(ss.Max) {
 			return false
 		}
 	}
 	return true
+}
+
+// FromInt creates a Number from an int64.
+func FromInt(i int64) Number {
+	if i < 0 {
+		return Number{Negative: true, Value: uint64(-i)}
+	}
+	return Number{Value: uint64(i)}
+}
+
+// FromUint creates a Number from a uint64.
+func FromUint(i uint64) Number {
+	return Number{Value: i}
+}
+
+// FromFloat creates a Number from a float64. Input values with absolute value
+// outside the boundaries specified for the decimal64 value specified in
+// RFC6020/RFC7950 are clamped down to the closest boundary value.
+func FromFloat(f float64) Number {
+	if f > MaxDecimal64 {
+		return Number{
+			Value:          FromInt(MaxInt64).Value,
+			FractionDigits: 1,
+		}
+	}
+	if f < MinDecimal64 {
+		return Number{
+			Negative:       true,
+			Value:          FromInt(MaxInt64).Value,
+			FractionDigits: 1,
+		}
+	}
+
+	// Per RFC7950/6020, fraction-digits must be at least 1.
+	fracDig := uint8(1)
+	f *= 10.0
+	for ; Frac(f) != 0.0 && fracDig <= MaxFractionDigits; fracDig++ {
+		f *= 10.0
+	}
+	v := uint64(f)
+	negative := false
+	if f < 0 {
+		negative = true
+		v = -v
+	}
+
+	return Number{Negative: negative, Value: v, FractionDigits: fracDig}
+}
+
+// ParseInt returns s as a Number with FractionDigits=0.
+// octal, or hexadecimal using the standard prefix notations (e.g., 0 and 0x)
+func ParseInt(s string) (Number, error) {
+	s = strings.TrimSpace(s)
+	var n Number
+	switch s {
+	case "":
+		return n, errors.New("converting empty string to number")
+	case "+", "-":
+		return n, errors.New("sign with no value")
+	}
+
+	ns := s
+	switch s[0] {
+	case '+':
+		ns = s[1:]
+	case '-':
+		n.Negative = true
+		ns = s[1:]
+	}
+
+	var err error
+	n.Value, err = strconv.ParseUint(ns, 0, 64)
+	return n, err
+}
+
+// ParseDecimal returns s as a Number with a non-zero FractionDigits.
+// octal, or hexadecimal using the standard prefix notations (e.g., 0 and 0x)
+func ParseDecimal(s string, fracDigRequired uint8) (n Number, err error) {
+	s = strings.TrimSpace(s)
+	switch s {
+	case "":
+		return n, errors.New("converting empty string to number")
+	case "+", "-":
+		return n, errors.New("sign with no value")
+	}
+
+	return decimalValueFromString(s, fracDigRequired)
+}
+
+// decimalValueFromString returns a decimal Number representation of numStr.
+// fracDigRequired is used to set the number of fractional digits, which must
+// be at least the greatest precision seen in numStr.
+// which must be between 1 and 18.
+// numStr must conform to Section 9.3.4.
+func decimalValueFromString(numStr string, fracDigRequired uint8) (n Number, err error) {
+	if fracDigRequired > MaxFractionDigits || fracDigRequired < 1 {
+		return n, fmt.Errorf("invalid number of fraction digits %d > max of %d, minimum 1", fracDigRequired, MaxFractionDigits)
+	}
+
+	s := numStr
+	dx := strings.Index(s, ".")
+	var fracDig uint8
+	if dx >= 0 {
+		fracDig = uint8(len(s) - 1 - dx)
+		// remove first decimal, if dx > 1, will fail ParseInt below
+		s = s[:dx] + s[dx+1:]
+	}
+
+	if fracDig > fracDigRequired {
+		return n, fmt.Errorf("%s has too much precision, expect <= %d fractional digits", s, fracDigRequired)
+	}
+
+	s += space18[:fracDigRequired-fracDig]
+
+	v, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return n, fmt.Errorf("%s is not a valid decimal number: %s", numStr, err)
+	}
+
+	negative := false
+	if v < 0 {
+		negative = true
+		v = -v
+	}
+
+	return Number{Value: uint64(v), FractionDigits: fracDigRequired, Negative: negative}, nil
+}
+
+// ParseRangesInt parses s into a series of ranges. Each individual range is in s
+// is separated by the pipe character (|).  The min and max value of a range
+// are separated by "..".  An error is returned if the range is invalid. The
+// output range is sorted and coalesced.
+func ParseRangesInt(s string) (YangRange, error) {
+	return YangRange{}.parseChildRanges(s, false, 0)
+}
+
+// ParseRangesDecimal parses s into a series of ranges. Each individual range is in s
+// is separated by the pipe character (|).  The min and max value of a range
+// are separated by "..".  An error is returned if the range is invalid. The
+// output range is sorted and coalesced.
+func ParseRangesDecimal(s string, fracDigRequired uint8) (YangRange, error) {
+	return YangRange{}.parseChildRanges(s, true, fracDigRequired)
+}
+
+// parseChildRanges parses a child ranges statement 's' into a series of ranges
+// based on an already-parsed parent YangRange. Each individual range is in s
+// is separated by the pipe character (|). The min and max value of a range are
+// separated by "..". An error is returned if the child ranges are not
+// equally-limiting or more limiting than the parent range
+// (rfc7950#section-9.2.5). The output range is sorted and coalesced.
+// fracDigRequired is ignored when decimal=false.
+func (y YangRange) parseChildRanges(s string, decimal bool, fracDigRequired uint8) (YangRange, error) {
+	parseNumber := func(s string) (Number, error) {
+		switch {
+		case s == "max":
+			if len(y) == 0 {
+				return Number{}, errors.New("cannot resolve 'max' keyword using an empty YangRange parent object")
+			}
+			max := y[len(y)-1].Max
+			max.FractionDigits = fracDigRequired
+			return max, nil
+		case s == "min":
+			if len(y) == 0 {
+				return Number{}, errors.New("cannot resolve 'min' keyword using an empty YangRange parent object")
+			}
+			min := y[0].Min
+			min.FractionDigits = fracDigRequired
+			return min, nil
+		case decimal:
+			return ParseDecimal(s, fracDigRequired)
+		default:
+			return ParseInt(s)
+		}
+	}
+
+	parts := strings.Split(s, "|")
+	r := make(YangRange, len(parts))
+	for i, s := range parts {
+		parts := strings.Split(s, "..")
+		min, err := parseNumber(strings.TrimSpace(parts[0]))
+		if err != nil {
+			return nil, err
+		}
+		var max Number
+		switch len(parts) {
+		case 1:
+			max = min
+		case 2:
+			if max, err = parseNumber(strings.TrimSpace(parts[1])); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, fmt.Errorf("too many '..' in %s", s)
+		}
+		if max.Less(min) {
+			return nil, fmt.Errorf("range boundaries out of order (%s less than %s): %s", max, min, s)
+		}
+		r[i] = YRange{min, max}
+	}
+	r.Sort()
+	r = coalesce(r)
+
+	if !y.Contains(r) {
+		return nil, fmt.Errorf("%v not within %v", s, y)
+	}
+
+	if err := r.Validate(); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
+// coalesce coalesces r into as few ranges as possible.  For example,
+// 1..5|6..10 would become 1..10.  r is assumed to be sorted.
+func coalesce(r YangRange) YangRange {
+	// coalesce the ranges if we have more than 1.
+	if len(r) < 2 {
+		return r
+	}
+	cr := make(YangRange, len(r))
+	i := 0
+	cr[i] = r[0]
+	for _, r1 := range r[1:] {
+		// r1.Min is always at least as large as cr[i].Min
+		// Cases are:
+		// r1 is contained in cr[i]
+		// r1 starts inside of cr[i]
+		// r1.Min cr[i].Max+1
+		// r1 is beyond cr[i]
+		if cr[i].Max.addQuantum(1).Less(r1.Min) {
+			// r1 starts after cr[i], this is a new range
+			i++
+			cr[i] = r1
+		} else if cr[i].Max.Less(r1.Max) {
+			cr[i].Max = r1.Max
+		}
+	}
+	return cr[:i+1]
+}
+
+func mustParseRangesInt(s string) YangRange {
+	r, err := ParseRangesInt(s)
+	if err != nil {
+		panic(err)
+	}
+	return r
+}
+
+func mustParseRangesDecimal(s string, fracDigRequired uint8) YangRange {
+	r, err := ParseRangesDecimal(s, fracDigRequired)
+	if err != nil {
+		panic(err)
+	}
+	return r
 }
 
 // Frac returns the fractional part of f.
@@ -1034,4 +563,138 @@ func pow10(e uint8) uint64 {
 		out *= 10
 	}
 	return out
+}
+
+// A EnumType represents a mapping of strings to integers.  It is used both
+// for enumerations as well as bitfields.
+type EnumType struct {
+	last     int64            // maximum value assigned thus far
+	min      int64            // minimum value allowed
+	max      int64            // maximum value allowed
+	unique   bool             // numeric values must be unique (enums)
+	ToString map[int64]string `json:",omitempty"` // map of enum entries by value (integer)
+	ToInt    map[string]int64 `json:",omitempty"` // map of enum entries by name (string)
+}
+
+// NewEnumType returns an initialized EnumType.
+func NewEnumType() *EnumType {
+	return &EnumType{
+		last:     -1, // +1 will start at 0
+		min:      MinEnum,
+		max:      MaxEnum,
+		unique:   true,
+		ToString: map[int64]string{},
+		ToInt:    map[string]int64{},
+	}
+}
+
+// NewBitfield returns an EnumType initialized as a bitfield.  Multiple string
+// values may map to the same numeric values.  Numeric values must be small
+// non-negative integers.
+func NewBitfield() *EnumType {
+	return &EnumType{
+		last:     -1, // +1 will start at 0
+		min:      0,
+		max:      MaxBitfieldSize - 1,
+		ToString: map[int64]string{},
+		ToInt:    map[string]int64{},
+	}
+}
+
+// Set sets name in e to the provided value.  Set returns an error if the value
+// is invalid, name is already signed, or when used as an enum rather than a
+// bitfield, the value has previousl been used.  When two different names are
+// assigned to the same value, the conversion from value to name will result in
+// the most recently assigned name.
+func (e *EnumType) Set(name string, value int64) error {
+	if _, ok := e.ToInt[name]; ok {
+		return fmt.Errorf("field %s already assigned", name)
+	}
+	if oname, ok := e.ToString[value]; e.unique && ok {
+		return fmt.Errorf("fields %s and %s conflict on value %d", name, oname, value)
+	}
+	if value < e.min {
+		return fmt.Errorf("value %d for %s too small (minimum is %d)", value, name, e.min)
+	}
+	if value > e.max {
+		return fmt.Errorf("value %d for %s too large (maximum is %d)", value, name, e.max)
+	}
+	e.ToString[value] = name
+	e.ToInt[name] = value
+	if value >= e.last {
+		e.last = value
+	}
+	return nil
+}
+
+// SetNext sets the name in e using the next possible value that is greater than
+// all previous values.
+func (e *EnumType) SetNext(name string) error {
+	if e.last == MaxEnum {
+		return fmt.Errorf("enum %q must specify a value since previous enum is the maximum value allowed", name)
+	}
+	return e.Set(name, e.last+1)
+}
+
+// Name returns the name in e associated with value.  The empty string is
+// returned if no name has been assigned to value.
+func (e *EnumType) Name(value int64) string { return e.ToString[value] }
+
+// Value returns the value associated with name in e associated.  0 is returned
+// if name is not in e, or if it is the first value in an unnumbered enum. Use
+// IsDefined to definitively confirm name is in e.
+func (e *EnumType) Value(name string) int64 { return e.ToInt[name] }
+
+// IsDefined returns true if name is defined in e, else false.
+func (e *EnumType) IsDefined(name string) bool {
+	_, defined := e.ToInt[name]
+	return defined
+}
+
+// Names returns the sorted list of enum string names.
+func (e *EnumType) Names() []string {
+	names := make([]string, len(e.ToInt))
+	i := 0
+	for name := range e.ToInt {
+		names[i] = name
+		i++
+	}
+	sort.Strings(names)
+	return names
+}
+
+type int64Slice []int64
+
+func (p int64Slice) Len() int           { return len(p) }
+func (p int64Slice) Less(i, j int) bool { return p[i] < p[j] }
+func (p int64Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }
+
+// Values returns the sorted list of enum values.
+func (e *EnumType) Values() []int64 {
+	values := make([]int64, len(e.ToInt))
+	i := 0
+	for _, value := range e.ToInt {
+		values[i] = value
+		i++
+	}
+	sort.Sort(int64Slice(values))
+	return values
+}
+
+// NameMap returns a map of names to values.
+func (e *EnumType) NameMap() map[string]int64 {
+	m := make(map[string]int64, len(e.ToInt))
+	for name, value := range e.ToInt {
+		m[name] = value
+	}
+	return m
+}
+
+// ValueMap returns a map of values to names.
+func (e *EnumType) ValueMap() map[int64]string {
+	m := make(map[int64]string, len(e.ToString))
+	for name, value := range e.ToString {
+		m[name] = value
+	}
+	return m
 }

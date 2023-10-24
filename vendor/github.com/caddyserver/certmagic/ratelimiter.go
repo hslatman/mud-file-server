@@ -1,3 +1,17 @@
+// Copyright 2015 Matthew Holt
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package certmagic
 
 import (
@@ -19,7 +33,7 @@ func NewRateLimiter(maxEvents int, window time.Duration) *RingBufferRateLimiter 
 		panic("maxEvents cannot be less than zero")
 	}
 	if maxEvents == 0 && window != 0 {
-		panic("invalid configuration: maxEvents = 0 and window != 0 would not allow any events")
+		panic("NewRateLimiter: invalid configuration: maxEvents = 0 and window != 0 would not allow any events")
 	}
 	rbrl := &RingBufferRateLimiter{
 		window:  window,
@@ -130,14 +144,15 @@ func (r *RingBufferRateLimiter) MaxEvents() int {
 // the oldest events will be forgotten. If the new limit is
 // higher, the window will suddenly have capacity for new
 // reservations. It panics if maxEvents is 0 and window size
-// is not zero.
+// is not zero; if setting both the events limit and the
+// window size to 0, call SetWindow() first.
 func (r *RingBufferRateLimiter) SetMaxEvents(maxEvents int) {
 	newRing := make([]time.Time, maxEvents)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	if r.window != 0 && maxEvents == 0 {
-		panic("invalid configuration: maxEvents = 0 and window != 0 would not allow any events")
+		panic("SetMaxEvents: invalid configuration: maxEvents = 0 and window != 0 would not allow any events")
 	}
 
 	// only make the change if the new limit is different
@@ -189,7 +204,7 @@ func (r *RingBufferRateLimiter) SetWindow(window time.Duration) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if window != 0 && len(r.ring) == 0 {
-		panic("invalid configuration: maxEvents = 0 and window != 0 would not allow any events")
+		panic("SetWindow: invalid configuration: maxEvents = 0 and window != 0 would not allow any events")
 	}
 	r.window = window
 }
